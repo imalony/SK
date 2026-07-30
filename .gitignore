@@ -1,0 +1,9 @@
+apps/api/.venv/
+apps/web/node_modules/
+apps/web/dist/
+data/
+.runtime/
+__pycache__/
+*.pyc
+*.log
+.env

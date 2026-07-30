@@ -1,0 +1,8 @@
+sk2_models:
+  base_path: F:\SK2-models
+  is_default: true
+  diffusion_models: diffusion_models
+  text_encoders: text_encoders
+  vae: vae
+  clip_vision: clip_vision
+  loras: loras

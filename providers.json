@@ -1,0 +1,183 @@
+{
+  "default_provider": "local-wan-vace",
+  "providers": [
+    {
+      "id": "local-wan-vace",
+      "label": "Local Wan2.1 VACE",
+      "kind": "comfyui",
+      "model": "Wan2.1-VACE-1.3B",
+      "enabled": true,
+      "capabilities": [
+        "text_to_video",
+        "image_to_video",
+        "video_edit"
+      ],
+      "settings": {
+        "base_url": "http://127.0.0.1:8188",
+        "input_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\input",
+        "output_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\output",
+        "workflows": {
+          "text": "wan_vace_text_to_video_api.json",
+          "image": "wan_vace_image_to_video_api.json",
+          "edit": "wan_vace_video_edit_api.json"
+        }
+      }
+    },
+    {
+      "id": "external-video-api",
+      "label": "External Video API (configure first)",
+      "kind": "http-api",
+      "model": "configure-me",
+      "enabled": false,
+      "capabilities": [
+        "text_to_video",
+        "image_to_video",
+        "video_edit"
+      ],
+      "settings": {
+        "base_url": "",
+        "api_key_env": "SK2_VIDEO_API_KEY"
+      }
+    },
+    {
+      "id": "agnes-video-v2",
+      "label": "Agnes Video V2.0 (cloud)",
+      "kind": "agnes-video",
+      "model": "agnes-video-v2.0",
+      "enabled": true,
+      "capabilities": [
+        "text_to_video"
+      ],
+      "settings": {
+        "base_url": "https://apihub.agnes-ai.com/v1",
+        "result_url": "https://apihub.agnes-ai.com/agnesapi",
+        "api_key_env": "SK2_AGNES_API_KEY",
+        "poll_interval_seconds": 5,
+        "poll_timeout_seconds": 1200
+      }
+    },
+    {
+      "id": "alibaba-happyhorse-t2v",
+      "label": "Alibaba HappyHorse 1.1 T2V (trial)",
+      "kind": "wanx-video",
+      "model": "happyhorse-1.1-t2v",
+      "enabled": true,
+      "capabilities": ["text_to_video"],
+      "settings": {
+        "base_url": "https://dashscope.aliyuncs.com",
+        "api_key_env": "ALI_API_KEY",
+        "resolution_options": ["480P", "720P", "1080P"],
+        "default_resolution": "480P",
+        "resolution_parameter": "resolution",
+        "duration_min_seconds": 3,
+        "duration_max_seconds": 15,
+        "supports_ratio": true,
+        "prompt_extend": false,
+        "poll_interval_seconds": 15,
+        "poll_timeout_seconds": 1800,
+        "prompt_extend": true,
+        "requires_payment_confirmation": true
+      }
+    },
+    {
+      "id": "alibaba-happyhorse-i2v",
+      "label": "Alibaba HappyHorse 1.1 I2V (trial)",
+      "kind": "wanx-video",
+      "model": "happyhorse-1.1-i2v",
+      "enabled": true,
+      "capabilities": ["image_to_video", "video_continue"],
+      "settings": {
+        "base_url": "https://dashscope.aliyuncs.com",
+        "api_key_env": "ALI_API_KEY",
+        "resolution_options": ["480P", "720P", "1080P"],
+        "default_resolution": "480P",
+        "resolution_parameter": "resolution",
+        "media_type": "first_frame",
+        "duration_min_seconds": 3,
+        "duration_max_seconds": 15,
+        "supports_ratio": false,
+        "prompt_extend": false,
+        "poll_interval_seconds": 15,
+        "poll_timeout_seconds": 1800,
+        "prompt_extend": true,
+        "requires_payment_confirmation": true
+      }
+    },
+    {
+      "id": "alibaba-happyhorse-r2v",
+      "label": "Alibaba HappyHorse 1.1 R2V (trial)",
+      "kind": "wanx-video",
+      "model": "happyhorse-1.1-r2v",
+      "enabled": true,
+      "capabilities": ["image_to_video", "video_continue"],
+      "settings": {
+        "base_url": "https://dashscope.aliyuncs.com",
+        "api_key_env": "ALI_API_KEY",
+        "resolution_options": ["480P", "720P", "1080P"],
+        "default_resolution": "480P",
+        "resolution_parameter": "resolution",
+        "media_type": "reference_image",
+        "continuation_media_type": "reference_image",
+        "reference_prompt_prefix": "参考 [Image 1] 中的人物、产品和场景外观，保持主体一致：",
+        "duration_min_seconds": 3,
+        "duration_max_seconds": 15,
+        "supports_ratio": true,
+        "prompt_extend": false,
+        "poll_interval_seconds": 15,
+        "poll_timeout_seconds": 1800,
+        "prompt_extend": true,
+        "requires_payment_confirmation": true
+      }
+    },
+    {
+      "id": "alibaba-wan27-t2v",
+      "label": "Alibaba Wan 2.7 T2V (trial)",
+      "kind": "wanx-video",
+      "model": "wan2.7-t2v-2026-06-12",
+      "enabled": true,
+      "capabilities": ["text_to_video"],
+      "settings": {
+        "base_url": "https://dashscope.aliyuncs.com",
+        "api_key_env": "ALI_API_KEY",
+        "resolution_options": ["720P", "1080P"],
+        "default_resolution": "720P",
+        "resolution_parameter": "resolution",
+        "duration_min_seconds": 2,
+        "duration_max_seconds": 15,
+        "supports_ratio": true,
+        "supports_negative_prompt": true,
+        "poll_interval_seconds": 15,
+        "poll_timeout_seconds": 1800,
+        "prompt_extend": true,
+        "requires_payment_confirmation": true
+      }
+    },
+    {
+      "id": "alibaba-wan27-r2v",
+      "label": "Alibaba Wan 2.7 R2V (trial)",
+      "kind": "wanx-video",
+      "model": "wan2.7-r2v-2026-06-12",
+      "enabled": true,
+      "capabilities": ["image_to_video", "video_continue"],
+      "settings": {
+        "base_url": "https://dashscope.aliyuncs.com",
+        "api_key_env": "ALI_API_KEY",
+        "resolution_options": ["720P", "1080P"],
+        "default_resolution": "720P",
+        "resolution_parameter": "resolution",
+        "media_type": "reference_image",
+        "continuation_media_type": "first_frame",
+        "continuation_add_reference_image": true,
+        "reference_prompt_prefix": "参考 [Image 1] 中的人物、产品和场景外观，保持主体一致：",
+        "duration_min_seconds": 2,
+        "duration_max_seconds": 15,
+        "supports_ratio": true,
+        "supports_negative_prompt": true,
+        "poll_interval_seconds": 15,
+        "poll_timeout_seconds": 1800,
+        "prompt_extend": true,
+        "requires_payment_confirmation": true
+      }
+    }
+  ]
+}
