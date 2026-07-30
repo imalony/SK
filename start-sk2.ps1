@@ -1,6 +1,7 @@
 param(
     [switch]$OpenBrowser,
-    [switch]$StartLocalModels
+    [switch]$StartLocalModels,
+    [string]$Services = "12"
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +15,10 @@ $apiDir = Join-Path $rootDir "apps\api"
 $apiPython = Join-Path $apiDir ".venv\Scripts\python.exe"
 $webDir = Join-Path $rootDir "apps\web"
 $ollamaPath = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"
+$framePackDir = "F:\SK2-runtime\FramePack"
+$framePackPython = Join-Path $framePackDir ".venv\Scripts\python.exe"
+$framePackMain = Join-Path $framePackDir "demo_gradio.py"
+$framePackApiSetup = Join-Path $rootDir "scripts\configure-framepack-api.ps1"
 $envFile = Join-Path $rootDir ".env"
 
 if (Test-Path $envFile) {
@@ -71,7 +76,8 @@ function Start-BackgroundService {
         [int]$Port,
         [string]$FilePath,
         [string[]]$ArgumentList,
-        [string]$WorkingDirectory
+        [string]$WorkingDirectory,
+        [int]$StartupTimeoutSeconds = 90
     )
 
     if (Test-ListeningPort -Port $Port) {
@@ -87,26 +93,30 @@ function Start-BackgroundService {
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $runtimeDir "$Name.stdout.log") `
         -RedirectStandardError (Join-Path $runtimeDir "$Name.stderr.log")
-    Wait-ForPort -Name $Name -Port $Port
+    Wait-ForPort -Name $Name -Port $Port -TimeoutSeconds $StartupTimeoutSeconds
 }
 
-if (-not (Test-Path $apiPython)) {
+$selectedServices = @($Services.ToCharArray() | Where-Object { $_ -match "[1-5]" } | Select-Object -Unique)
+if ($StartLocalModels) {
+    $selectedServices = @("1", "2", "3", "4")
+}
+if ($selectedServices.Count -eq 0) {
+    $selectedServices = @("1", "2")
+}
+
+if (($selectedServices -contains "1") -and -not (Test-Path $apiPython)) {
     throw "API virtual environment was not found: $apiPython"
 }
 if (-not (Test-Path (Join-Path $rootDir "providers.json"))) {
     throw "Provider configuration was not found: $(Join-Path $rootDir 'providers.json')"
 }
 
-if ($StartLocalModels) {
-    if (-not (Test-Path $comfyPython)) {
-        throw "ComfyUI Python was not found: $comfyPython"
-    }
-
+if ($selectedServices -contains "4") {
     if (-not (Test-ListeningPort -Port 11434)) {
         if (-not (Test-Path $ollamaPath)) {
             $ollamaCommand = Get-Command ollama.exe -ErrorAction SilentlyContinue
             if ($null -eq $ollamaCommand) {
-                throw "Ollama was not found. Install Ollama or start it before running this script."
+                throw "Ollama was not found. Install Ollama or do not select service 4."
             }
             $ollamaPath = $ollamaCommand.Source
         }
@@ -120,7 +130,12 @@ if ($StartLocalModels) {
     else {
         Write-Host "ollama is already running on port 11434."
     }
+}
 
+if ($selectedServices -contains "3") {
+    if (-not (Test-Path $comfyPython)) {
+        throw "ComfyUI Python was not found: $comfyPython"
+    }
     Start-BackgroundService `
         -Name "comfyui" `
         -Port 8188 `
@@ -135,40 +150,73 @@ if ($StartLocalModels) {
         ) `
         -WorkingDirectory (Join-Path $comfyRuntime "ComfyUI")
 }
-else {
-    Write-Host "Local video model was not started. Run the launcher and choose Y when you need local generation."
+
+if ($selectedServices -contains "5") {
+    if (($selectedServices -contains "3") -or ($selectedServices -contains "4")) {
+        Write-Warning "FramePack shares limited GPU/system memory with ComfyUI and Ollama. On this 8 GB GPU, prefer selection 125 instead of running 3, 4, and 5 together."
+    }
+    if (-not (Test-Path $framePackPython)) {
+        throw "FramePack environment was not found: $framePackPython"
+    }
+    if (-not (Test-Path $framePackMain)) {
+        throw "FramePack program was not found: $framePackMain"
+    }
+    if (-not (Test-Path $framePackApiSetup)) {
+        throw "FramePack API setup script was not found: $framePackApiSetup"
+    }
+    & $framePackApiSetup -FramePackDir $framePackDir
+    Start-BackgroundService `
+        -Name "framepack" `
+        -Port 7860 `
+        -FilePath $framePackPython `
+        -ArgumentList @($framePackMain, "--server", "127.0.0.1", "--port", "7860") `
+        -WorkingDirectory $framePackDir `
+        -StartupTimeoutSeconds 1800
 }
 
-Start-BackgroundService `
-    -Name "api" `
-    -Port 8000 `
-    -FilePath $apiPython `
-    -ArgumentList @("-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000") `
-    -WorkingDirectory $apiDir
-
-$npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
-if ($null -eq $npmCommand) {
-    throw "npm.cmd was not found. Install Node.js before starting the frontend."
+if ($selectedServices -contains "1") {
+    Start-BackgroundService `
+        -Name "api" `
+        -Port 8000 `
+        -FilePath $apiPython `
+        -ArgumentList @("-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000") `
+        -WorkingDirectory $apiDir
 }
-Start-BackgroundService `
-    -Name "web" `
-    -Port 5173 `
-    -FilePath $npmCommand.Source `
-    -ArgumentList @("run", "dev", "--", "--host", "127.0.0.1", "--port", "5173") `
-    -WorkingDirectory $webDir
 
+if ($selectedServices -contains "2") {
+    $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if ($null -eq $npmCommand) {
+        throw "npm.cmd was not found. Install Node.js before starting the frontend."
+    }
+    Start-BackgroundService `
+        -Name "web" `
+        -Port 5173 `
+        -FilePath $npmCommand.Source `
+        -ArgumentList @("run", "dev", "--", "--host", "127.0.0.1", "--port", "5173") `
+        -WorkingDirectory $webDir
+}
+
+if ($selectedServices -contains "1") {
 try {
     $health = Invoke-RestMethod "http://127.0.0.1:8000/api/health"
-    Write-Host "API health: ComfyUI=$($health.services.comfyui), Ollama=$($health.services.ollama)"
+    Write-Host "API health: ComfyUI=$($health.services.comfyui), Ollama=$($health.services.ollama), FramePack=$($health.services.framepack)"
 }
 catch {
     Write-Warning "Services started, but the API health check did not complete: $($_.Exception.Message)"
 }
+}
 
 Write-Host ""
-Write-Host "SK2 Advertising Studio: http://127.0.0.1:5173/"
-Write-Host "Technical test workspace: http://127.0.0.1:5173/test"
+Write-Host "Selected services: $($selectedServices -join ', ')"
+Write-Host "1=API  2=Web  3=ComfyUI  4=Ollama  5=FramePack"
+if ($selectedServices -contains "2") {
+    Write-Host "SK2 Advertising Studio: http://127.0.0.1:5173/"
+    Write-Host "Technical test workspace: http://127.0.0.1:5173/test"
+}
+if ($selectedServices -contains "5") {
+    Write-Host "FramePack: http://127.0.0.1:7860/"
+}
 Write-Host "Keep this window open to view startup messages. Closing it does not stop background services."
-if ($OpenBrowser) {
+if ($OpenBrowser -and ($selectedServices -contains "2")) {
     Start-Process "http://127.0.0.1:5173"
 }

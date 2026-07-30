@@ -16,7 +16,7 @@
   } from '@lucide/svelte'
 
   type ServiceHealth = {
-    services: { comfyui: boolean; ollama: boolean }
+    services: { comfyui: boolean; ollama: boolean; framepack: boolean }
     providers: Record<string, boolean>
     queue_active: boolean
     model_runtime: {
@@ -28,7 +28,7 @@
   type VideoProvider = {
     id: string
     label: string
-    kind: 'comfyui' | 'http-api' | 'agnes-video' | 'wanx-video'
+    kind: 'comfyui' | 'http-api' | 'agnes-video' | 'wanx-video' | 'framepack-gradio'
     model: string
     enabled: boolean
     available: boolean
@@ -74,7 +74,7 @@
   let videoResolution = ''
   let providerId = 'local-wan-vace'
   let health: ServiceHealth = {
-    services: { comfyui: false, ollama: false },
+    services: { comfyui: false, ollama: false, framepack: false },
     providers: {},
     queue_active: false,
     model_runtime: { busy: false, activity: 'idle' },

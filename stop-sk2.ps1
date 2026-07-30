@@ -44,7 +44,8 @@ function Get-ManagedModelProcesses {
             $commandLine -and (
                 $commandLine -match '(?i)ComfyUI[\\/].*main\.py' -or
                 $commandLine -match '(?i)ollama\.exe"\s+serve' -or
-                $commandLine -match '(?i)ollama\s+app\.exe'
+                $commandLine -match '(?i)ollama\s+app\.exe' -or
+                $commandLine -match '(?i)FramePack[\\/].*demo_gradio\.py'
             )
         }
     )
@@ -87,8 +88,9 @@ Stop-ServiceOnPort -Name "web" -Port 5173
 Stop-ServiceOnPort -Name "api" -Port 8000
 Stop-ServiceOnPort -Name "comfyui" -Port 8188
 Stop-ServiceOnPort -Name "ollama" -Port 11434
+Stop-ServiceOnPort -Name "framepack" -Port 7860
 Stop-ManagedModelProcesses
 
 if (-not $WhatIf) {
-    Write-Host "SK2 frontend, API, ComfyUI, and Ollama services stopped."
+    Write-Host "SK2 frontend, API, ComfyUI, Ollama, and FramePack services stopped."
 }
