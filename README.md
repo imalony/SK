@@ -405,11 +405,13 @@ Double-click `start-sk2.cmd` and enter one or more service numbers:
 | `4` | Ollama local planning model |
 | `5` | FramePack local long-video provider |
 
-The default is `12`, which starts only the backend and frontend. For
-FramePack, use `125`. On an RTX 5050 Laptop with 8 GB VRAM, do not normally
-run `3`, `4`, and `5` together; FramePack can use substantial system memory
-while it dynamically loads models. The launcher waits up to 30 minutes for
-the first FramePack start because of the model download.
+The default is `12`, which starts only the backend and frontend. For local
+Wan, use `123`; for FramePack, use `125`. The launcher rejects a selection
+that includes both `3` and `5`, so two local video models cannot be started
+together. The API serializes all video jobs with one shared lock and releases
+ComfyUI models before a FramePack job starts. FramePack can use substantial
+system memory while it dynamically loads models. The launcher waits up to 30
+minutes for the first FramePack start because of the model download.
 
 `stop-sk2.cmd` stops the frontend, API, ComfyUI, Ollama, and FramePack. It
 also asks the API to cancel current tasks and release local model resources

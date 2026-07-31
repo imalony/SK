@@ -1324,6 +1324,13 @@ async def release_comfy_models(
         pass
 
 
+async def release_all_comfy_models() -> None:
+    async with httpx.AsyncClient(timeout=30) as client:
+        for configured_provider in PROVIDERS.values():
+            if configured_provider.enabled and configured_provider.kind == "comfyui":
+                await release_comfy_models(client, configured_provider)
+
+
 async def interrupt_comfy_provider(provider: VideoProvider) -> None:
     if provider.kind != "comfyui":
         return
@@ -1987,6 +1994,8 @@ async def run_generation(generation_id: str) -> None:
                     await run_wanx_generation(provider, generation)
                     return
                 if provider.kind == "framepack-gradio":
+                    # FramePack and Wan cannot occupy GPU memory together.
+                    await release_all_comfy_models()
                     model_activity = "framepack_video_provider"
                     await run_framepack_generation(provider, generation)
                     return

@@ -103,6 +103,9 @@ if ($StartLocalModels) {
 if ($selectedServices.Count -eq 0) {
     $selectedServices = @("1", "2")
 }
+if (($selectedServices -contains "3") -and ($selectedServices -contains "5")) {
+    throw "ComfyUI local Wan (3) and FramePack (5) cannot be started together. Choose 123 for Wan or 125 for FramePack."
+}
 
 if (($selectedServices -contains "1") -and -not (Test-Path $apiPython)) {
     throw "API virtual environment was not found: $apiPython"
@@ -152,8 +155,8 @@ if ($selectedServices -contains "3") {
 }
 
 if ($selectedServices -contains "5") {
-    if (($selectedServices -contains "3") -or ($selectedServices -contains "4")) {
-        Write-Warning "FramePack shares limited GPU/system memory with ComfyUI and Ollama. On this 8 GB GPU, prefer selection 125 instead of running 3, 4, and 5 together."
+    if ($selectedServices -contains "4") {
+        Write-Warning "FramePack and Ollama share system memory. On this 8 GB GPU, use selection 125 unless local planning is required."
     }
     if (-not (Test-Path $framePackPython)) {
         throw "FramePack environment was not found: $framePackPython"
