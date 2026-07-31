@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte'
   import {
     AlertTriangle, Check, Download, Film, ImagePlus, LoaderCircle, MessageSquareText,
-    History, Music2, Pencil, Play, Send, Settings2, Sparkles, Square, Subtitles, Video, Volume2, X
+    History, Music2, Pencil, Play, Send, Settings2, Sparkles, Square, Subtitles, Trash2, Video, Volume2, X
   } from '@lucide/svelte'
 
   const apiBase = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
@@ -16,6 +16,8 @@
   type Plan = {
     id: string
     version: number
+    approved_at?: number | null
+    created_at?: number
     plan: {
       title: string
       strategy: string
@@ -41,6 +43,11 @@
     video_provider_id: string
     video_resolution?: string | null
     video_fps: number
+    video_provider?: { id: string; label: string; model: string; kind: string }
+    llm_base_url?: string | null
+    llm_model?: string | null
+    llm_api?: string | null
+    llm_trace?: Array<{ base_url: string; model: string; api: string; stage: string; recorded_at: number }>
     target_duration_seconds: number
     voice_enabled: boolean
     subtitle_enabled: boolean
@@ -68,6 +75,10 @@
       sequence_number: number
       status: string
       target_duration_seconds: number
+      prompt?: string
+      review?: Record<string, unknown> | null
+      retry_count?: number
+      output_url?: string
       generation?: { status: string; progress: number; error_message?: string }
     }>
     runs: Array<{ stage: string; progress: number; status: string; details?: { sequence?: number; total?: number } }>
@@ -124,6 +135,13 @@
     final_version_count: number
     created_at: number
     completed_at?: number
+    video_provider_id: string
+    video_provider_label: string
+    video_provider_model: string
+    video_resolution?: string | null
+    video_fps: number
+    llm_model?: string | null
+    llm_api?: string | null
   }
 
   const activeProjectStorageKey = 'sk2-ad-active-project-id'
@@ -174,6 +192,7 @@
   let historyLoading = false
   let historyItems: HistoryProject[] = []
   let historyError = ''
+  let deletingHistoryProjectId: string | null = null
   let showPaymentConfirmation = false
   let paymentConfirmingPlanVersion: number | null = null
   let draftStorageReady = false
@@ -688,6 +707,18 @@
     return `${item.completed_segment_count}/${item.segment_count} 段已完成`
   }
 
+  function llmStageLabel(stage: string): string {
+    return ({
+      reference_video_analysis: '参考视频拆解',
+      plan_generation: '总体规划与分镜',
+      segment_prompt_rewrite: '单镜提示词改写',
+      plan_prompt_rewrite: '整体提示词改写',
+      segment_transition: '镜头衔接决策',
+      segment_review: '镜头审片',
+      final_copy_rewrite: '成片配文改写'
+    } as Record<string, string>)[stage] ?? stage
+  }
+
   function isActiveProjectStatus(status: string): boolean {
     return ['approved', 'generating_segments', 'reviewing_segments', 'composing_audio_video'].includes(status)
   }
@@ -723,6 +754,21 @@
       error = cause instanceof Error ? cause.message : '无法打开历史作品'
     } finally {
       loading = false
+    }
+  }
+
+  async function deleteHistoryProject(projectId: string) {
+    if (!window.confirm('删除后会移除该任务的素材、分镜、视频及后期版本，且无法恢复。是否继续？')) return
+    deletingHistoryProjectId = projectId
+    historyError = ''
+    try {
+      await request<{ id: string; deleted: boolean }>(`/api/ad-projects/${projectId}`, { method: 'DELETE' })
+      historyItems = historyItems.filter((item) => item.id !== projectId)
+      if (project?.id === projectId) reset()
+    } catch (cause) {
+      historyError = cause instanceof Error ? cause.message : '删除任务失败'
+    } finally {
+      deletingHistoryProjectId = null
     }
   }
 
@@ -974,6 +1020,62 @@
           <p class="no-final-versions">此项目尚未按新版结构保存后期版本。</p>
         {/if}
       </section>
+      <section class="artifact-panel">
+        <details open>
+          <summary>模型来源与调用记录</summary>
+          <div class="artifact-body">
+            <p><strong>视频模型：</strong>{project.video_provider?.label ?? project.video_provider_id} · {project.video_provider?.model ?? '配置已不在当前列表'} · {project.video_resolution ?? '原生分辨率'} · {project.video_fps} FPS</p>
+            <p><strong>规划与审片模型：</strong>{project.llm_model ? `${project.llm_model} · ${project.llm_api ?? 'responses'} · ${project.llm_base_url ?? ''}` : '尚未调用规划模型或该记录创建于模型追踪上线前'}</p>
+            {#if project.llm_trace?.length}
+              <div class="model-trace">
+                {#each project.llm_trace as trace}
+                  <span>{historyDate(trace.recorded_at)} · {llmStageLabel(trace.stage)} · {trace.model} · {trace.api}</span>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </details>
+        <details>
+          <summary>总体方案、分镜与提示词（{project.plans.length} 个版本）</summary>
+          <div class="artifact-body artifact-plan-list">
+            {#each project.plans as plan}
+              <article class="artifact-plan">
+                <strong>方案 {plan.version}{plan.approved_at ? '（已确认）' : ''}</strong>
+                <p>{plan.plan.strategy}</p>
+                {#if plan.plan.visual_bible}
+                  <p class="artifact-muted">视觉方向：{plan.plan.visual_bible.art_direction}</p>
+                  <p class="artifact-muted">光色：{plan.plan.visual_bible.lighting_and_palette}</p>
+                {/if}
+                <p><strong>配音文案：</strong>{plan.plan.voiceover_script || '未启用配音'}</p>
+                <p><strong>发布文案：</strong>{plan.plan.post_caption}</p>
+                <p><strong>话题：</strong>{plan.plan.hashtags.join(' ')}</p>
+                <div class="artifact-shots">
+                  {#each plan.plan.segments as segment, index}
+                    <div>
+                      <strong>镜头 {String(index + 1).padStart(2, '0')} · {segment.duration_seconds} 秒</strong>
+                      <p>{segment.purpose} · {segment.motion}</p>
+                      {#if segment.voiceover_beat}<p class="artifact-muted">配音节拍：{segment.voiceover_beat}</p>{/if}
+                      <pre class="artifact-prompt">{segment.prompt}</pre>
+                    </div>
+                  {/each}
+                </div>
+              </article>
+            {/each}
+          </div>
+        </details>
+        <details>
+          <summary>实际生成镜头与审片记录（{project.segments.length} 条）</summary>
+          <div class="artifact-body artifact-segment-list">
+            {#each project.segments as segment}
+              <article class="artifact-segment">
+                <strong>镜头 {String(segment.sequence_number).padStart(2, '0')} · {segment.status} · 第 {Number(segment.retry_count ?? 0) + 1} 次尝试</strong>
+                {#if segment.prompt}<pre class="artifact-prompt">{segment.prompt}</pre>{/if}
+                {#if segment.review}<pre class="artifact-review">{JSON.stringify(segment.review, null, 2)}</pre>{/if}
+              </article>
+            {/each}
+          </div>
+        </details>
+      </section>
       <section class="post-edit">
         <div><p class="eyebrow">后期调整</p><h2>AI 重写配音与配文</h2></div>
         <p>AI 会复盘当前成片的关键画面并重写文案，不会重新生成视频画面。确认后仅重新配音、字幕、背景音乐和导出成片。</p>
@@ -1063,8 +1165,15 @@
                   <strong>{item.title} <span class:complete-status={item.status === 'completed'} class:recoverable-status={['failed', 'cancelled', 'interrupted'].includes(item.status)} class="task-status">{projectStatusLabel(item.status)}</span></strong>
                   <p>{item.brief}</p>
                   <small>{Math.round(item.target_duration_seconds)} 秒 · {projectProgress(item)} · {item.final_version_count} 个后期版本 · {historyDate(item.completed_at ?? item.created_at)}</small>
+                  <small class="history-models">视频：{item.video_provider_label} · {item.video_provider_model || '未记录型号'} · {item.video_resolution ?? '原生分辨率'} · {item.video_fps} FPS</small>
+                  <small class="history-models">规划/审片：{item.llm_model ? `${item.llm_model} · ${item.llm_api ?? 'responses'}` : '尚未调用或历史记录未追踪'}</small>
                 </div>
-                <button class="secondary-command" disabled={loading} on:click={() => openHistoryProject(item.id)}>{item.status === 'completed' ? '打开并调整' : '打开任务'}</button>
+                <div class="history-actions">
+                  <button class="secondary-command" disabled={loading || deletingHistoryProjectId !== null} on:click={() => openHistoryProject(item.id)}>{item.status === 'completed' ? '打开并调整' : '打开任务'}</button>
+                  <button class="header-icon-command delete-history-command" title="删除任务" aria-label="删除任务" disabled={loading || deletingHistoryProjectId !== null} on:click={() => deleteHistoryProject(item.id)}>
+                    {#if deletingHistoryProjectId === item.id}<span class="spin"><LoaderCircle size={16} /></span>{:else}<Trash2 size={16} />{/if}
+                  </button>
+                </div>
               </article>
             {/each}
           </div>
@@ -1242,6 +1351,23 @@
   .final-version small { color: #809087; font-size: 12px; }
   .final-version .secondary-command { width: auto; min-width: 112px; margin: 0; padding: 0 12px; }
   .no-final-versions { margin: 16px 0 0; color: #74857d; font-size: 13px; }
+  .artifact-panel { margin-top: 42px; border-top: 1px solid #d8e1dc; }
+  .artifact-panel details { border-bottom: 1px solid #d8e1dc; }
+  .artifact-panel summary { padding: 16px 0; color: #29473d; cursor: pointer; font-size: 15px; font-weight: 800; }
+  .artifact-body { padding: 0 0 18px; color: #53685f; font-size: 13px; line-height: 1.6; }
+  .artifact-body > p { margin: 7px 0; }
+  .artifact-muted { color: #74877e; }
+  .model-trace { display: grid; gap: 5px; margin-top: 12px; }
+  .model-trace span { display: block; padding: 7px 9px; border-left: 3px solid #67a48f; color: #4b655a; background: #f2f8f4; font-size: 12px; }
+  .artifact-plan-list, .artifact-segment-list { display: grid; gap: 16px; }
+  .artifact-plan, .artifact-segment { padding: 13px 0; border-top: 1px solid #e0e8e3; }
+  .artifact-plan:first-child, .artifact-segment:first-child { border-top: 0; }
+  .artifact-plan > p { margin: 7px 0; white-space: pre-wrap; }
+  .artifact-shots { display: grid; gap: 10px; margin-top: 12px; }
+  .artifact-shots > div { padding: 10px; border-left: 3px solid #c5ddd2; background: #f8fbf9; }
+  .artifact-shots p { margin: 5px 0; }
+  .artifact-prompt, .artifact-review { margin: 8px 0 0; padding: 9px; overflow: auto; border: 1px solid #d9e6df; border-radius: 4px; color: #3d5e52; background: #f5faf7; font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .artifact-review { color: #4b5f57; background: #fbfcfb; }
   .post-edit { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.4fr); gap: 18px 32px; margin-top: 48px; padding-top: 26px; border-top: 1px solid #d8e1dc; } .post-edit h2 { margin: 0; font-size: 20px; } .post-edit > p { margin: 0; color: #667970; line-height: 1.6; } .post-edit-grid { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; } .post-edit-grid label { display: grid; gap: 7px; color: #4b6158; font-size: 13px; font-weight: 750; } .post-edit-grid textarea { min-height: 92px; } .post-edit-grid input { height: 38px; padding: 0 10px; border: 1px solid #cbd7d0; border-radius: 5px; background: #fff; outline: none; } .post-edit-options { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: 16px; } .post-edit-options label { display: inline-flex; align-items: center; gap: 6px; color: #52665d; font-size: 13px; } .post-edit-options .secondary-command { width: auto; min-width: 178px; margin: 0 0 0 auto; padding: 0 14px; }
   .copy-rewrite { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; padding: 14px; border: 1px solid #d9e6df; border-radius: 6px; background: #f7fbf8; }
   .copy-rewrite label { display: grid; gap: 7px; color: #4b6158; font-size: 13px; font-weight: 750; }
@@ -1260,8 +1386,13 @@
   .history-placeholder { width: 118px; aspect-ratio: 9 / 16; display: grid; place-items: center; border-radius: 4px; color: #779087; background: #e8eeea; }
   .history-item strong { display: block; color: #24372f; font-size: 15px; }
   .history-item p { display: -webkit-box; margin: 5px 0 8px; overflow: hidden; color: #667970; font-size: 13px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
-  .history-item small { color: #809087; font-size: 12px; }
+  .history-item small { display: block; color: #809087; font-size: 12px; }
+  .history-models { margin-top: 4px; color: #5d756b !important; }
   .history-item .secondary-command { width: auto; min-width: 108px; margin: 0; padding: 0 12px; }
+  .history-actions { display: flex; align-items: center; gap: 7px; }
+  .history-actions .secondary-command { min-width: 108px; }
+  .delete-history-command { flex: 0 0 34px; color: #a54236; border-color: #dfb8b1; }
+  .delete-history-command:hover:not(:disabled) { color: #8e3328; border-color: #c98880; background: #fff4f1; }
   .task-status { display: inline-flex; align-items: center; margin-left: 7px; padding: 2px 6px; border-radius: 4px; color: #5f7169; background: #edf1ef; font-size: 11px; font-weight: 750; vertical-align: middle; }
   .task-status.complete-status { color: #1d735f; background: #e4f3ec; }
   .task-status.recoverable-status { color: #9b5925; background: #fff0df; }
@@ -1278,5 +1409,5 @@
   .payment-confirmation-copy small { grid-column: 2; color: #876a38; line-height: 1.5; }
   .modal-cancel { min-height: 40px; padding: 0 16px; border: 1px solid #a6b9b0; border-radius: 5px; color: #365248; background: #fff; font-weight: 750; }
   .modal-save { width: auto; min-width: 106px; margin: 0; padding: 0 16px; }
-  @media (max-width: 760px) { .ad-header { padding: 0 20px; } .header-history-command { width: 34px; justify-content: center; padding: 0; font-size: 0; } .ad-shell { width: min(100% - 32px, 1180px); padding-top: 38px; } h1 { font-size: 26px; } .maker-grid, .plan-layout, .result-layout, .post-edit { grid-template-columns: 1fr; gap: 28px; } .settings-section, .confirm-panel { padding-left: 0; border-left: 0; border-top: 1px solid #d9e1dc; padding-top: 24px; } .image-grid, .post-edit-grid { grid-template-columns: 1fr; } .shot-ai-rewrite { grid-template-columns: 1fr; } .shot-ai-rewrite .secondary-command { width: 100%; } .copy-rewrite { grid-template-columns: 1fr; } .copy-rewrite .secondary-command { width: 100%; } .post-edit-options .secondary-command, .return-plan-command { width: 100%; margin: 0 0 10px; } .final-version { grid-template-columns: 82px minmax(0, 1fr); } .final-version video, .history-placeholder { width: 82px; max-height: 120px; } .final-version .secondary-command { grid-column: 1 / -1; width: 100%; } .history-item { grid-template-columns: 76px minmax(0, 1fr); } .history-item video, .history-item .history-placeholder { width: 76px; max-height: 108px; } .history-item .secondary-command { grid-column: 1 / -1; width: 100%; } .modal-backdrop { padding: 14px; } .model-settings-modal, .history-modal { padding: 18px; } }
+  @media (max-width: 760px) { .ad-header { padding: 0 20px; } .header-history-command { width: 34px; justify-content: center; padding: 0; font-size: 0; } .ad-shell { width: min(100% - 32px, 1180px); padding-top: 38px; } h1 { font-size: 26px; } .maker-grid, .plan-layout, .result-layout, .post-edit { grid-template-columns: 1fr; gap: 28px; } .settings-section, .confirm-panel { padding-left: 0; border-left: 0; border-top: 1px solid #d9e1dc; padding-top: 24px; } .image-grid, .post-edit-grid { grid-template-columns: 1fr; } .shot-ai-rewrite { grid-template-columns: 1fr; } .shot-ai-rewrite .secondary-command { width: 100%; } .copy-rewrite { grid-template-columns: 1fr; } .copy-rewrite .secondary-command { width: 100%; } .post-edit-options .secondary-command, .return-plan-command { width: 100%; margin: 0 0 10px; } .final-version { grid-template-columns: 82px minmax(0, 1fr); } .final-version video, .history-placeholder { width: 82px; max-height: 120px; } .final-version .secondary-command { grid-column: 1 / -1; width: 100%; } .history-item { grid-template-columns: 76px minmax(0, 1fr); } .history-item video, .history-item .history-placeholder { width: 76px; max-height: 108px; } .history-actions { grid-column: 1 / -1; } .history-actions .secondary-command { width: 100%; } .history-item video, .history-item .history-placeholder { width: 76px; max-height: 108px; } .modal-backdrop { padding: 14px; } .model-settings-modal, .history-modal { padding: 18px; } }
 </style>

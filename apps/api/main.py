@@ -488,7 +488,52 @@ def ad_llm_settings() -> dict[str, str]:
         "video_provider_id": get_app_setting(
             "ad_default_video_provider_id", DEFAULT_PROVIDER_ID
         ),
+        "api": "responses",
     }
+
+
+def ad_llm_public_snapshot(settings: dict[str, str] | None = None) -> dict[str, str]:
+    source = settings or ad_llm_settings()
+    return {
+        "base_url": source["base_url"],
+        "model": source["model"],
+        "api": source["api"],
+    }
+
+
+def record_ad_llm_usage(project_id: str, stage: str, settings: dict[str, str]) -> None:
+    snapshot = {
+        **ad_llm_public_snapshot(settings),
+        "stage": stage,
+        "recorded_at": now(),
+    }
+    with database() as connection:
+        row = connection.execute(
+            "SELECT llm_trace_json FROM ad_projects WHERE id = ?", (project_id,)
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            trace = json.loads(row["llm_trace_json"] or "[]")
+        except (TypeError, ValueError):
+            trace = []
+        if not isinstance(trace, list):
+            trace = []
+        trace.append(snapshot)
+        connection.execute(
+            """
+            UPDATE ad_projects
+            SET llm_base_url = ?, llm_model = ?, llm_api = ?, llm_trace_json = ?
+            WHERE id = ?
+            """,
+            (
+                snapshot["base_url"],
+                snapshot["model"],
+                snapshot["api"],
+                json.dumps(trace[-100:], ensure_ascii=False),
+                project_id,
+            ),
+        )
 
 
 def initialize_database() -> None:
@@ -551,6 +596,10 @@ def initialize_database() -> None:
               video_provider_id TEXT NOT NULL DEFAULT 'local-wan-vace',
               video_resolution TEXT,
               video_fps INTEGER NOT NULL DEFAULT 8,
+              llm_base_url TEXT,
+              llm_model TEXT,
+              llm_api TEXT,
+              llm_trace_json TEXT NOT NULL DEFAULT '[]',
               reference_video_path TEXT,
               reference_analysis_json TEXT,
               tts_provider TEXT NOT NULL,
@@ -684,6 +733,16 @@ def initialize_database() -> None:
             connection.execute(
                 "ALTER TABLE ad_projects ADD COLUMN video_fps INTEGER NOT NULL DEFAULT 8"
             )
+        if "llm_base_url" not in columns:
+            connection.execute("ALTER TABLE ad_projects ADD COLUMN llm_base_url TEXT")
+        if "llm_model" not in columns:
+            connection.execute("ALTER TABLE ad_projects ADD COLUMN llm_model TEXT")
+        if "llm_api" not in columns:
+            connection.execute("ALTER TABLE ad_projects ADD COLUMN llm_api TEXT")
+        if "llm_trace_json" not in columns:
+            connection.execute(
+                "ALTER TABLE ad_projects ADD COLUMN llm_trace_json TEXT NOT NULL DEFAULT '[]'"
+            )
         if "master_output_path" not in columns:
             connection.execute(
                 "ALTER TABLE ad_projects ADD COLUMN master_output_path TEXT"
@@ -816,6 +875,8 @@ async def request_ad_llm(
     system_prompt: str,
     user_prompt: str,
     image_paths: list[Path] | None = None,
+    usage_project_id: str | None = None,
+    usage_stage: str = "advertising_generation",
 ) -> dict[str, Any]:
     settings = ad_llm_settings()
     api_key = settings["api_key"]
@@ -826,6 +887,8 @@ async def request_ad_llm(
         )
     base_url = settings["base_url"]
     model = settings["model"]
+    if usage_project_id:
+        record_ad_llm_usage(usage_project_id, usage_stage, settings)
     content: list[dict[str, Any]] = [{"type": "input_text", "text": user_prompt}]
     for path in (image_paths or [])[:12]:
         if path.is_file():
@@ -1248,6 +1311,19 @@ def ad_project_detail(project_id: str) -> dict[str, Any]:
     result["voice_enabled"] = bool(result["voice_enabled"])
     result["subtitle_enabled"] = bool(result["subtitle_enabled"])
     result["bgm_enabled"] = bool(result["bgm_enabled"])
+    try:
+        llm_trace = json.loads(result.pop("llm_trace_json", "[]") or "[]")
+    except (TypeError, ValueError):
+        llm_trace = []
+    result["llm_trace"] = llm_trace if isinstance(llm_trace, list) else []
+    provider = PROVIDERS.get(result.get("video_provider_id", ""))
+    if provider is not None:
+        result["video_provider"] = {
+            "id": provider.id,
+            "label": provider.label,
+            "model": provider.model,
+            "kind": provider.kind,
+        }
     if result.get("reference_video_path"):
         result["reference_video_url"] = f"/media/{result['reference_video_path']}"
     if result.get("reference_analysis_json"):
@@ -2493,7 +2569,9 @@ def extract_reference_video_frames(source: Path, target_dir: Path) -> list[Path]
     return frames
 
 
-async def analyze_reference_video(source: Path, frame_dir: Path) -> dict[str, Any]:
+async def analyze_reference_video(
+    source: Path, frame_dir: Path, *, project_id: str | None = None
+) -> dict[str, Any]:
     frames = await asyncio.to_thread(extract_reference_video_frames, source, frame_dir)
     try:
         analysis = await request_ad_llm(
@@ -2503,6 +2581,8 @@ async def analyze_reference_video(source: Path, frame_dir: Path) -> dict[str, An
                 "结果只能指导全新原创广告，不得复刻原视频的画面、品牌标识、人物、文字或具体场景。"
             ),
             image_paths=frames,
+            usage_project_id=project_id,
+            usage_stage="reference_video_analysis",
         )
         analysis["frame_count"] = len(frames)
         return analysis
@@ -2559,6 +2639,8 @@ async def write_ad_final_copy(
             ensure_ascii=False,
         ),
         image_paths=frames,
+        usage_project_id=project["id"],
+        usage_stage="final_copy_rewrite",
     )
     voiceover_script = str(result.get("voiceover_script", "")).strip()[:2000]
     post_caption = str(result.get("post_caption", "")).strip()[:1000]
@@ -3042,6 +3124,8 @@ async def review_ad_segment(
             system_prompt=load_ad_prompt("segment_reviewer_v1.md"),
             user_prompt=user_prompt,
             image_paths=frames,
+            usage_project_id=project["id"],
+            usage_stage="segment_review",
         )
         review = AdSegmentReview.model_validate(raw_review)
     except (RuntimeError, ValidationError) as error:
@@ -3076,6 +3160,8 @@ async def plan_ad_segment_transition(
             system_prompt=load_ad_prompt("segment_transition_v1.md"),
             user_prompt=user_prompt,
             image_paths=previous_frames[-3:],
+            usage_project_id=project["id"],
+            usage_stage="segment_transition",
         )
         decision = AdTransitionDecision.model_validate(raw_decision)
         return {
@@ -4019,6 +4105,11 @@ async def ad_project_history() -> dict[str, Any]:
               projects.id,
               projects.brief,
               projects.target_duration_seconds,
+              projects.video_provider_id,
+              projects.video_resolution,
+              projects.video_fps,
+              projects.llm_model,
+              projects.llm_api,
               projects.master_output_path,
               projects.final_output_path,
               projects.status,
@@ -4064,12 +4155,140 @@ async def ad_project_history() -> dict[str, Any]:
         master_output_path = item.pop("master_output_path")
         item.pop("plan_json", None)
         item["title"] = str(plan.get("title") or item["brief"])[:120]
+        provider = PROVIDERS.get(item.get("video_provider_id", ""))
+        item["video_provider_label"] = provider.label if provider else item.get(
+            "video_provider_id", ""
+        )
+        item["video_provider_model"] = provider.model if provider else ""
         if final_output_path:
             item["output_url"] = f"/media/{final_output_path}"
         if master_output_path:
             item["master_output_url"] = f"/media/{master_output_path}"
         items.append(item)
     return {"items": items}
+
+
+def remove_project_path(root: Path, target: Path) -> None:
+    """Remove a known project artifact only when it resolves beneath its storage root."""
+    resolved_root = root.resolve()
+    resolved_target = target.resolve()
+    if resolved_target == resolved_root or resolved_root not in resolved_target.parents:
+        raise RuntimeError(f"Refusing to remove path outside project storage: {target}")
+    if resolved_target.is_dir():
+        shutil.rmtree(resolved_target)
+    elif resolved_target.is_file():
+        resolved_target.unlink()
+
+
+@app.delete("/api/ad-projects/{project_id}")
+async def delete_ad_project(project_id: str) -> dict[str, Any]:
+    project = ad_project_detail(project_id)
+    active_statuses = {
+        "approved",
+        "generating_segments",
+        "reviewing_segments",
+        "composing_audio_video",
+    }
+    active_task = ad_project_tasks.get(project_id)
+    if project["status"] in active_statuses or (active_task and not active_task.done()):
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the active advertising task before deleting it.",
+        )
+
+    with database() as connection:
+        asset_rows = connection.execute(
+            "SELECT asset_id FROM ad_assets WHERE project_id = ?", (project_id,)
+        ).fetchall()
+        generation_rows = connection.execute(
+            """
+            SELECT generations.id, generations.parent_generation_id, generations.output_path
+            FROM generations
+            JOIN ad_segments ON ad_segments.generation_id = generations.id
+            WHERE ad_segments.project_id = ?
+            """,
+            (project_id,),
+        ).fetchall()
+        active_generation = connection.execute(
+            """
+            SELECT 1
+            FROM generations
+            JOIN ad_segments ON ad_segments.generation_id = generations.id
+            WHERE ad_segments.project_id = ?
+              AND generations.status IN ('queued', 'preparing', 'running')
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        if active_generation is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Stop the active video generation before deleting this task.",
+            )
+
+        generation_ids = {str(row["id"]) for row in generation_rows}
+        output_paths = {
+            str(row["output_path"])
+            for row in generation_rows
+            if row["output_path"]
+        }
+        pending_parent_ids = {
+            str(row["parent_generation_id"])
+            for row in generation_rows
+            if row["parent_generation_id"]
+        }
+        while pending_parent_ids:
+            parent_id = pending_parent_ids.pop()
+            if parent_id in generation_ids:
+                continue
+            parent = connection.execute(
+                "SELECT id, parent_generation_id, output_path FROM generations WHERE id = ?",
+                (parent_id,),
+            ).fetchone()
+            if parent is None:
+                continue
+            generation_ids.add(str(parent["id"]))
+            if parent["output_path"]:
+                output_paths.add(str(parent["output_path"]))
+            if parent["parent_generation_id"]:
+                pending_parent_ids.add(str(parent["parent_generation_id"]))
+
+        connection.execute("DELETE FROM ad_final_versions WHERE project_id = ?", (project_id,))
+        connection.execute("DELETE FROM ad_runs WHERE project_id = ?", (project_id,))
+        connection.execute(
+            "DELETE FROM ad_recovery_attempts WHERE project_id = ?", (project_id,)
+        )
+        connection.execute("DELETE FROM ad_segments WHERE project_id = ?", (project_id,))
+        connection.execute("DELETE FROM ad_plans WHERE project_id = ?", (project_id,))
+        connection.execute("DELETE FROM ad_assets WHERE project_id = ?", (project_id,))
+        if asset_rows:
+            placeholders = ",".join("?" for _ in asset_rows)
+            connection.execute(
+                f"DELETE FROM assets WHERE id IN ({placeholders})",
+                [row["asset_id"] for row in asset_rows],
+            )
+        if generation_ids:
+            placeholders = ",".join("?" for _ in generation_ids)
+            connection.execute(
+                f"DELETE FROM generations WHERE id IN ({placeholders})",
+                list(generation_ids),
+            )
+        connection.execute("DELETE FROM ad_projects WHERE id = ?", (project_id,))
+
+    remove_project_path(AD_MEDIA_DIR, AD_MEDIA_DIR / project_id)
+    remove_project_path(AD_WORK_DIR, AD_WORK_DIR / project_id)
+    for output_path in output_paths:
+        relative_output = Path(output_path)
+        if relative_output.is_absolute() or ".." in relative_output.parts:
+            continue
+        output = MEDIA_DIR / relative_output
+        if output.is_file():
+            remove_project_path(MEDIA_DIR, output)
+    for generation_id in generation_ids:
+        generation_dir = MEDIA_DIR / generation_id
+        if generation_dir.is_dir():
+            remove_project_path(MEDIA_DIR, generation_dir)
+    return {"id": project_id, "deleted": True}
 
 
 @app.get("/api/ad-projects/{project_id}")
@@ -4139,7 +4358,9 @@ async def upload_reference_video(
     target.write_bytes(content)
     try:
         analysis = await analyze_reference_video(
-            target, AD_WORK_DIR / project_id / "reference-analysis"
+            target,
+            AD_WORK_DIR / project_id / "reference-analysis",
+            project_id=project_id,
         )
     except RuntimeError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -4246,6 +4467,8 @@ async def create_ad_plan_version(
             system_prompt=load_ad_prompt("planner_v1.md"),
             user_prompt=json.dumps(instruction, ensure_ascii=False),
             image_paths=asset_image_paths + reference_video_frames,
+            usage_project_id=project_id,
+            usage_stage="plan_generation",
         )
     except RuntimeError:
         plan = fallback_ad_plan(project, len(project["assets"]))
@@ -4459,6 +4682,8 @@ async def rewrite_ad_segment_prompt(
                 ensure_ascii=False,
             ),
             image_paths=context_asset_images + reference_video_frames,
+            usage_project_id=project_id,
+            usage_stage="segment_prompt_rewrite",
         )
     except RuntimeError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -4536,6 +4761,8 @@ async def rewrite_ad_plan_prompts(
                 ensure_ascii=False,
             ),
             image_paths=asset_image_paths + reference_video_frames,
+            usage_project_id=project_id,
+            usage_stage="plan_prompt_rewrite",
         )
     except RuntimeError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
