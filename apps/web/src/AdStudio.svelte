@@ -197,6 +197,7 @@
   let deletingHistoryProjectId: string | null = null
   let showPaymentConfirmation = false
   let paymentConfirmingPlanVersion: number | null = null
+  let paymentError = ''
   let draftStorageReady = false
 
   const bgmOptions = [
@@ -422,6 +423,7 @@
     try {
       await persistShotPrompts()
       if (activeVideoProvider?.requires_payment_confirmation) {
+        paymentError = ''
         paymentConfirmingPlanVersion = latestPlan.version
         showPaymentConfirmation = true
         return
@@ -438,6 +440,7 @@
     if (!project || !latestPlan) return
     loading = true
     error = ''
+    paymentError = ''
     try {
       project = await request<Project>(`/api/ad-projects/${project.id}/plan-approve`, {
         method: 'POST',
@@ -451,7 +454,9 @@
       paymentConfirmingPlanVersion = null
       startPolling()
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : '确认方案失败'
+      const message = cause instanceof Error ? cause.message : '确认方案失败'
+      error = message
+      paymentError = message
     } finally {
       loading = false
     }
@@ -460,6 +465,7 @@
   function cancelPaymentConfirmation() {
     showPaymentConfirmation = false
     paymentConfirmingPlanVersion = null
+    paymentError = ''
   }
 
   async function persistShotPrompts() {
@@ -1328,8 +1334,9 @@
           <small>确认后系统才会调用视频接口。取消会保留当前总体规划和全部镜头提示词。</small>
         </div>
         <div class="modal-actions">
-          <button class="modal-cancel" disabled={loading} on:click={cancelPaymentConfirmation}>返回修改</button>
-          <button class="approve-command modal-save" disabled={loading} on:click={() => submitPlanApproval(true)}>
+          {#if paymentError}<p class="payment-error">{paymentError}</p>{/if}
+          <button type="button" class="modal-cancel" disabled={loading} on:click={cancelPaymentConfirmation}>返回修改</button>
+          <button type="button" class="approve-command modal-save" disabled={loading} on:click={() => submitPlanApproval(true)}>
             {#if loading}<span class="spin"><LoaderCircle size={17} /></span> 正在提交{:else}确认付费并生成{/if}
           </button>
         </div>
@@ -1467,6 +1474,7 @@
   .payment-confirmation-copy { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 10px; margin: 20px 0; padding: 14px; border: 1px solid #e6c98d; border-radius: 6px; color: #76521d; background: #fff9eb; }
   .payment-confirmation-copy p { margin: 0; line-height: 1.65; }
   .payment-confirmation-copy small { grid-column: 2; color: #876a38; line-height: 1.5; }
+  .payment-error { flex: 1 0 100%; margin: 0 0 2px; padding: 10px 12px; border: 1px solid #edc7c0; border-radius: 5px; color: #a54236; background: #fff4f1; font-size: 13px; line-height: 1.5; }
   .modal-cancel { min-height: 40px; padding: 0 16px; border: 1px solid #a6b9b0; border-radius: 5px; color: #365248; background: #fff; font-weight: 750; }
   .modal-save { width: auto; min-width: 106px; margin: 0; padding: 0 16px; }
   @media (max-width: 760px) { .ad-header { padding: 0 20px; } .header-history-command { width: 34px; justify-content: center; padding: 0; font-size: 0; } .ad-shell { width: min(100% - 32px, 1180px); padding-top: 38px; } h1 { font-size: 26px; } .maker-grid, .plan-layout, .result-layout, .post-edit { grid-template-columns: 1fr; gap: 28px; } .settings-section, .confirm-panel { padding-left: 0; border-left: 0; border-top: 1px solid #d9e1dc; padding-top: 24px; } .image-grid, .post-edit-grid { grid-template-columns: 1fr; } .shot-ai-rewrite { grid-template-columns: 1fr; } .shot-ai-rewrite .secondary-command { width: 100%; } .copy-rewrite { grid-template-columns: 1fr; } .copy-rewrite .secondary-command { width: 100%; } .post-edit-options .secondary-command, .return-plan-command { width: 100%; margin: 0 0 10px; } .final-version { grid-template-columns: 82px minmax(0, 1fr); } .final-version video, .history-placeholder { width: 82px; max-height: 120px; } .final-version .secondary-command { grid-column: 1 / -1; width: 100%; } .history-item { grid-template-columns: 76px minmax(0, 1fr); } .history-item video, .history-item .history-placeholder { width: 76px; max-height: 108px; } .history-actions { grid-column: 1 / -1; } .history-actions .secondary-command { width: 100%; } .history-item video, .history-item .history-placeholder { width: 76px; max-height: 108px; } .modal-backdrop { padding: 14px; } .model-settings-modal, .history-modal { padding: 18px; } }

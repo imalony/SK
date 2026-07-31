@@ -4922,8 +4922,8 @@ async def approve_ad_plan(
             "UPDATE ad_projects SET status = 'approved', approved_plan_version = ?, plan_approved_at = ?, error_message = NULL WHERE id = ?",
             (request.version, confirmed_at, project_id),
         )
-    await broadcast_ad_project(project_id)
     start_ad_project_task(project_id)
+    await broadcast_ad_project(project_id)
     return ad_project_detail(project_id)
 
 
