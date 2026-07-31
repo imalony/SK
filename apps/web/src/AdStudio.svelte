@@ -101,14 +101,19 @@
     id: string
     brief: string
     title: string
+    status: string
+    error_message?: string
     target_duration_seconds: number
-    output_url: string
+    output_url?: string
     master_output_url?: string
+    segment_count: number
+    completed_segment_count: number
     final_version_count: number
     created_at: number
     completed_at?: number
   }
 
+  const activeProjectStorageKey = 'sk2-ad-active-project-id'
   let files: File[] = []
   let previews: string[] = []
   let referenceVideo: File | null = null
@@ -190,6 +195,9 @@
     finalBgmEnabled = project?.bgm_enabled ?? true
     finalVoiceId = project?.voice_id ?? voices[0].id
     finalBgmId = project?.bgm_id ?? 'default/ambient'
+  }
+  $: if (project?.id && typeof localStorage !== 'undefined') {
+    localStorage.setItem(activeProjectStorageKey, project.id)
   }
 
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -599,6 +607,7 @@
   function reset() {
     stopPolling()
     project = null
+    localStorage.removeItem(activeProjectStorageKey)
     feedback = ''
     replanFeedback = ''
     replanFromSegment = 2
@@ -610,6 +619,31 @@
     return new Intl.DateTimeFormat('zh-CN', {
       year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
     }).format(new Date(timestamp * 1000))
+  }
+
+  function projectStatusLabel(status: string): string {
+    return ({
+      draft: '草稿',
+      planning: '正在规划',
+      waiting_user_confirmation: '等待确认',
+      approved: '等待执行',
+      generating_segments: '生成分镜中',
+      reviewing_segments: '复盘分镜中',
+      composing_audio_video: '正在合成',
+      interrupted: '服务中断，可继续',
+      failed: '失败，可继续',
+      cancelled: '已停止，可继续',
+      completed: '已完成'
+    } as Record<string, string>)[status] ?? status
+  }
+
+  function projectProgress(item: HistoryProject): string {
+    if (!item.segment_count) return item.status === 'waiting_user_confirmation' ? '方案待确认' : '尚未生成分镜'
+    return `${item.completed_segment_count}/${item.segment_count} 段已完成`
+  }
+
+  function isActiveProjectStatus(status: string): boolean {
+    return ['approved', 'generating_segments', 'reviewing_segments', 'composing_audio_video'].includes(status)
   }
 
   async function openHistory() {
@@ -633,7 +667,7 @@
       project = await request<Project>(`/api/ad-projects/${projectId}`)
       editorPlanId = ''
       showHistory = false
-      if (['approved', 'generating_segments', 'reviewing_segments', 'composing_audio_video'].includes(project.status)) {
+      if (isActiveProjectStatus(project.status)) {
         startPolling()
       } else {
         stopPolling()
@@ -667,6 +701,10 @@
     } catch {
       // The built-in defaults remain usable until settings can be loaded.
     }
+    const savedProjectId = localStorage.getItem(activeProjectStorageKey)
+    if (savedProjectId) {
+      await openHistoryProject(savedProjectId)
+    }
   })
 </script>
 
@@ -674,7 +712,7 @@
   <header class="ad-header">
     <a class="ad-brand" href="/"><Film size={21} /> 广告成片</a>
     <div class="header-actions">
-      <button class="header-history-command" on:click={openHistory}><History size={17} /> 历史作品</button>
+      <button class="header-history-command" on:click={openHistory}><History size={17} /> 任务与历史</button>
       <button class="header-icon-command" title="模型设置" aria-label="模型设置" on:click={() => showModelSettings = true}>
         <Settings2 size={18} />
       </button>
@@ -882,17 +920,17 @@
           <button class="secondary-command" disabled={loading || rewritingFinalCopy || (finalVoiceEnabled && !finalVoiceover.trim())} on:click={recomposeFinal}><Pencil size={17} /> 应用并重新合成</button>
         </div>
       </section>
-    {:else if project.status === 'failed' || project.status === 'cancelled'}
+    {:else if project.status === 'failed' || project.status === 'cancelled' || project.status === 'interrupted'}
       <section class="run-screen terminal-screen">
         <AlertTriangle size={36} color="#b54f42" />
-        <p class="eyebrow">{project.status === 'failed' ? '生成失败' : '任务已停止'}</p>
-        <h1>{project.status === 'failed' ? '广告视频未能生成完成' : '广告视频制作已停止'}</h1>
+        <p class="eyebrow">{project.status === 'interrupted' ? '服务中断' : project.status === 'failed' ? '生成失败' : '任务已停止'}</p>
+        <h1>{project.status === 'interrupted' ? '可从已完成的步骤继续' : project.status === 'failed' ? '广告视频未能生成完成' : '广告视频制作已停止'}</h1>
         <p class="run-error">{project.error_message || '任务已停止，未继续执行。'}</p>
         <p>不会继续调用视频模型或消耗本地资源。</p>
         {#if project.plans.length}
           <button class="secondary-command return-plan-command" disabled={loading} on:click={returnToPlan}>返回已确认文案</button>
         {/if}
-        <button class="approve-command retry-command" disabled={loading} on:click={resumeFailedProject}>从失败镜头继续</button>
+        <button class="approve-command retry-command" disabled={loading} on:click={resumeFailedProject}>从未完成步骤继续</button>
         <button class="primary-command retry-command" on:click={reset}>重新制作</button>
       </section>
     {:else}
@@ -924,28 +962,32 @@
       <div class="history-modal" role="dialog" aria-modal="true" aria-labelledby="history-title">
         <div class="modal-header">
           <div>
-            <p class="eyebrow">历史作品</p>
-            <h2 id="history-title">已生成的视频</h2>
+            <p class="eyebrow">持久化任务</p>
+            <h2 id="history-title">全部任务与作品</h2>
           </div>
           <button class="header-icon-command" title="关闭" aria-label="关闭" on:click={() => showHistory = false}><X size={18} /></button>
         </div>
         {#if historyLoading}
-          <div class="history-empty"><span class="spin"><LoaderCircle size={24} /></span><p>正在加载历史作品</p></div>
+          <div class="history-empty"><span class="spin"><LoaderCircle size={24} /></span><p>正在加载任务</p></div>
         {:else if historyError}
           <div class="history-empty"><AlertTriangle size={24} color="#b54f42" /><p>{historyError}</p></div>
         {:else if !historyItems.length}
-          <div class="history-empty"><Film size={26} /><p>暂无已完成的视频</p></div>
+          <div class="history-empty"><Film size={26} /><p>暂无任务记录</p></div>
         {:else}
           <div class="history-list">
             {#each historyItems as item}
               <article class="history-item">
-                <video muted preload="metadata" playsinline src={`${apiBase}${item.output_url}`}></video>
+                {#if item.output_url}
+                  <video muted preload="metadata" playsinline src={`${apiBase}${item.output_url}`}></video>
+                {:else}
+                  <div class="history-placeholder"><Film size={24} /></div>
+                {/if}
                 <div>
-                  <strong>{item.title}</strong>
+                  <strong>{item.title} <span class:complete-status={item.status === 'completed'} class:recoverable-status={['failed', 'cancelled', 'interrupted'].includes(item.status)} class="task-status">{projectStatusLabel(item.status)}</span></strong>
                   <p>{item.brief}</p>
-                  <small>{Math.round(item.target_duration_seconds)} 秒 · {item.final_version_count} 个后期版本 · {historyDate(item.completed_at ?? item.created_at)}</small>
+                  <small>{Math.round(item.target_duration_seconds)} 秒 · {projectProgress(item)} · {item.final_version_count} 个后期版本 · {historyDate(item.completed_at ?? item.created_at)}</small>
                 </div>
-                <button class="secondary-command" disabled={loading} on:click={() => openHistoryProject(item.id)}>打开并调整</button>
+                <button class="secondary-command" disabled={loading} on:click={() => openHistoryProject(item.id)}>{item.status === 'completed' ? '打开并调整' : '打开任务'}</button>
               </article>
             {/each}
           </div>
@@ -1120,10 +1162,14 @@
   .history-list { display: grid; gap: 12px; padding-top: 18px; }
   .history-item { display: grid; grid-template-columns: 118px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 11px; border: 1px solid #dce5e0; border-radius: 6px; }
   .history-item video { width: 118px; aspect-ratio: 9 / 16; max-height: 150px; object-fit: cover; border-radius: 4px; background: #17211d; }
+  .history-placeholder { width: 118px; aspect-ratio: 9 / 16; display: grid; place-items: center; border-radius: 4px; color: #779087; background: #e8eeea; }
   .history-item strong { display: block; color: #24372f; font-size: 15px; }
   .history-item p { display: -webkit-box; margin: 5px 0 8px; overflow: hidden; color: #667970; font-size: 13px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; }
   .history-item small { color: #809087; font-size: 12px; }
   .history-item .secondary-command { width: auto; min-width: 108px; margin: 0; padding: 0 12px; }
+  .task-status { display: inline-flex; align-items: center; margin-left: 7px; padding: 2px 6px; border-radius: 4px; color: #5f7169; background: #edf1ef; font-size: 11px; font-weight: 750; vertical-align: middle; }
+  .task-status.complete-status { color: #1d735f; background: #e4f3ec; }
+  .task-status.recoverable-status { color: #9b5925; background: #fff0df; }
   .modal-header { display: flex; align-items: start; justify-content: space-between; gap: 18px; padding-bottom: 20px; border-bottom: 1px solid #dce5e0; }
   .modal-header .eyebrow { margin-bottom: 5px; } .modal-header h2 { margin: 0; color: #15201b; font-size: 22px; }
   .modal-fields { display: grid; gap: 16px; padding: 20px 0; }
@@ -1137,5 +1183,5 @@
   .payment-confirmation-copy small { grid-column: 2; color: #876a38; line-height: 1.5; }
   .modal-cancel { min-height: 40px; padding: 0 16px; border: 1px solid #a6b9b0; border-radius: 5px; color: #365248; background: #fff; font-weight: 750; }
   .modal-save { width: auto; min-width: 106px; margin: 0; padding: 0 16px; }
-  @media (max-width: 760px) { .ad-header { padding: 0 20px; } .header-history-command { width: 34px; justify-content: center; padding: 0; font-size: 0; } .ad-shell { width: min(100% - 32px, 1180px); padding-top: 38px; } h1 { font-size: 26px; } .maker-grid, .plan-layout, .result-layout, .post-edit { grid-template-columns: 1fr; gap: 28px; } .settings-section, .confirm-panel { padding-left: 0; border-left: 0; border-top: 1px solid #d9e1dc; padding-top: 24px; } .image-grid, .post-edit-grid { grid-template-columns: 1fr; } .shot-ai-rewrite { grid-template-columns: 1fr; } .shot-ai-rewrite .secondary-command { width: 100%; } .copy-rewrite { grid-template-columns: 1fr; } .copy-rewrite .secondary-command { width: 100%; } .post-edit-options .secondary-command, .return-plan-command { width: 100%; margin: 0 0 10px; } .final-version { grid-template-columns: 82px minmax(0, 1fr); } .final-version video { width: 82px; max-height: 120px; } .final-version .secondary-command { grid-column: 1 / -1; width: 100%; } .history-item { grid-template-columns: 76px minmax(0, 1fr); } .history-item video { width: 76px; max-height: 108px; } .history-item .secondary-command { grid-column: 1 / -1; width: 100%; } .modal-backdrop { padding: 14px; } .model-settings-modal, .history-modal { padding: 18px; } }
+  @media (max-width: 760px) { .ad-header { padding: 0 20px; } .header-history-command { width: 34px; justify-content: center; padding: 0; font-size: 0; } .ad-shell { width: min(100% - 32px, 1180px); padding-top: 38px; } h1 { font-size: 26px; } .maker-grid, .plan-layout, .result-layout, .post-edit { grid-template-columns: 1fr; gap: 28px; } .settings-section, .confirm-panel { padding-left: 0; border-left: 0; border-top: 1px solid #d9e1dc; padding-top: 24px; } .image-grid, .post-edit-grid { grid-template-columns: 1fr; } .shot-ai-rewrite { grid-template-columns: 1fr; } .shot-ai-rewrite .secondary-command { width: 100%; } .copy-rewrite { grid-template-columns: 1fr; } .copy-rewrite .secondary-command { width: 100%; } .post-edit-options .secondary-command, .return-plan-command { width: 100%; margin: 0 0 10px; } .final-version { grid-template-columns: 82px minmax(0, 1fr); } .final-version video, .history-placeholder { width: 82px; max-height: 120px; } .final-version .secondary-command { grid-column: 1 / -1; width: 100%; } .history-item { grid-template-columns: 76px minmax(0, 1fr); } .history-item video, .history-item .history-placeholder { width: 76px; max-height: 108px; } .history-item .secondary-command { grid-column: 1 / -1; width: 100%; } .modal-backdrop { padding: 14px; } .model-settings-modal, .history-modal { padding: 18px; } }
 </style>

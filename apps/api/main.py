@@ -2904,6 +2904,9 @@ async def run_ad_project(project_id: str) -> None:
 
 
 def start_ad_project_task(project_id: str) -> None:
+    existing_task = ad_project_tasks.get(project_id)
+    if existing_task and not existing_task.done():
+        return
     task = asyncio.create_task(run_ad_project(project_id))
     ad_project_tasks[project_id] = task
     task.add_done_callback(lambda _: ad_project_tasks.pop(project_id, None))
@@ -2942,14 +2945,82 @@ async def run_ad_recompose(project_id: str) -> None:
 
 
 def start_ad_recompose_task(project_id: str) -> None:
+    existing_task = ad_project_tasks.get(project_id)
+    if existing_task and not existing_task.done():
+        return
     task = asyncio.create_task(run_ad_recompose(project_id))
     ad_project_tasks[project_id] = task
     task.add_done_callback(lambda _: ad_project_tasks.pop(project_id, None))
 
 
+def reconcile_interrupted_work() -> None:
+    """Persist an actionable checkpoint when the API process previously stopped."""
+    interrupted_message = (
+        "API service restarted before this step completed. "
+        "Completed segments and all approved prompts were kept. Continue to retry "
+        "from the first unfinished step."
+    )
+    timestamp = now()
+    with database() as connection:
+        connection.execute(
+            """
+            UPDATE generations
+            SET status = 'failed',
+                progress = 1,
+                error_message = ?,
+                completed_at = ?
+            WHERE status IN ('queued', 'preparing', 'running')
+            """,
+            (interrupted_message, timestamp),
+        )
+        connection.execute(
+            """
+            UPDATE ad_runs
+            SET status = 'failed',
+                error_message = ?,
+                completed_at = ?
+            WHERE status = 'running'
+            """,
+            (interrupted_message, timestamp),
+        )
+        connection.execute(
+            """
+            UPDATE ad_recovery_attempts
+            SET status = 'failed',
+                error_message = ?,
+                completed_at = ?
+            WHERE status IN ('queued', 'running')
+            """,
+            (interrupted_message, timestamp),
+        )
+        connection.execute(
+            """
+            UPDATE ad_projects
+            SET status = 'interrupted',
+                error_message = ?
+            WHERE status IN (
+                'approved',
+                'generating_segments',
+                'reviewing_segments',
+                'composing_audio_video'
+            )
+            """,
+            (interrupted_message,),
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_database()
+    reconcile_interrupted_work()
+    await asyncio.gather(
+        *(
+            interrupt_comfy_provider(provider)
+            for provider in PROVIDERS.values()
+            if provider.enabled and provider.kind == "comfyui"
+        ),
+        return_exceptions=True,
+    )
     yield
 
 
@@ -3155,9 +3226,22 @@ async def ad_project_history() -> dict[str, Any]:
               projects.target_duration_seconds,
               projects.master_output_path,
               projects.final_output_path,
+              projects.status,
+              projects.error_message,
               projects.created_at,
               projects.completed_at,
               plans.plan_json,
+              (
+                SELECT COUNT(*)
+                FROM ad_segments AS segments
+                WHERE segments.project_id = projects.id
+              ) AS segment_count,
+              (
+                SELECT COUNT(*)
+                FROM ad_segments AS segments
+                WHERE segments.project_id = projects.id
+                  AND segments.status = 'succeeded'
+              ) AS completed_segment_count,
               (
                 SELECT COUNT(*)
                 FROM ad_final_versions AS versions
@@ -3165,10 +3249,13 @@ async def ad_project_history() -> dict[str, Any]:
               ) AS final_version_count
             FROM ad_projects AS projects
             LEFT JOIN ad_plans AS plans
-              ON plans.project_id = projects.id
-              AND plans.version = projects.approved_plan_version
-            WHERE projects.status = 'completed'
-              AND projects.final_output_path IS NOT NULL
+              ON plans.id = (
+                SELECT candidate.id
+                FROM ad_plans AS candidate
+                WHERE candidate.project_id = projects.id
+                ORDER BY candidate.version DESC
+                LIMIT 1
+              )
             ORDER BY COALESCE(projects.completed_at, projects.created_at) DESC
             LIMIT 100
             """
@@ -3179,11 +3266,13 @@ async def ad_project_history() -> dict[str, Any]:
         item = dict(row)
         plan = json.loads(item["plan_json"]) if item.get("plan_json") else {}
         final_output_path = item.pop("final_output_path")
+        master_output_path = item.pop("master_output_path")
         item.pop("plan_json", None)
         item["title"] = str(plan.get("title") or item["brief"])[:120]
-        item["output_url"] = f"/media/{final_output_path}"
-        if item.get("master_output_path"):
-            item["master_output_url"] = f"/media/{item['master_output_path']}"
+        if final_output_path:
+            item["output_url"] = f"/media/{final_output_path}"
+        if master_output_path:
+            item["master_output_url"] = f"/media/{master_output_path}"
         items.append(item)
     return {"items": items}
 
@@ -3700,7 +3789,7 @@ async def generate_approved_ad(
     project = ad_project_detail(project_id)
     if not project.get("approved_plan_version") or not project.get("plan_approved_at"):
         raise HTTPException(status_code=409, detail="Confirm a plan before generating video")
-    if project["status"] not in {"approved", "failed", "cancelled"}:
+    if project["status"] not in {"approved", "failed", "cancelled", "interrupted"}:
         raise HTTPException(status_code=409, detail="Project is already running or completed")
     provider = get_provider(
         project.get("video_provider_id", DEFAULT_PROVIDER_ID),
