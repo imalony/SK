@@ -23,4 +23,8 @@ only when the supplied first, middle, late and final frames are usable in an
 advertisement. All boolean fields must be JSON booleans, never strings.
 Decide should_continue for every segment. Continue only when the current duration
 is still shorter than the requested duration and another segment improves the
-shot. Do not continue merely because continuation is available.
+shot. Do not continue merely because continuation is available. Set
+continuation_prompt to an empty string when should_continue is false. Set
+retry_prompt to an empty string when approved is true. When either action is
+required, its corresponding prompt must be a usable Chinese prompt of at least
+five characters.

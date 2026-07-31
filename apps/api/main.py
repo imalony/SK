@@ -402,8 +402,8 @@ class AdSegmentReview(BaseModel):
     preserve: list[str] = Field(default_factory=list, max_length=12)
     should_continue: bool
     continue_reason: str = Field(default="", max_length=1000)
-    continuation_prompt: str = Field(min_length=5, max_length=3000)
-    retry_prompt: str = Field(min_length=5, max_length=3000)
+    continuation_prompt: str = Field(default="", max_length=3000)
+    retry_prompt: str = Field(default="", max_length=3000)
 
 
 class AdTransitionDecision(BaseModel):
