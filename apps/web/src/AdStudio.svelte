@@ -223,6 +223,17 @@
   $: activeRun = project?.runs.find((run) => run.status === 'running')
   $: progressPercent = Math.round(((activeSegment?.generation?.progress ?? activeRun?.progress ?? 0) * 100))
   $: availableSegmentOutputs = project?.segments.filter((segment) => Boolean(segment.output_url)) ?? []
+  $: canRetryComposition = Boolean(
+    project?.status === 'failed'
+    && latestPlan?.plan.segments.length
+    && latestPlan.plan.segments.every((_, index) =>
+      project?.segments.some((segment) =>
+        segment.sequence_number === index + 1
+        && segment.status === 'succeeded'
+        && Boolean(segment.output_url)
+      )
+    )
+  )
   $: if (latestPlan && latestPlan.id !== editorPlanId) {
     editorPlanId = latestPlan.id
     finalVoiceover = latestPlan.plan.voiceover_script
@@ -556,6 +567,7 @@
     if (!project) return
     if (
       activeVideoProvider?.requires_payment_confirmation
+      && !canRetryComposition
       && !window.confirm('将从失败镜头继续提交付费视频任务，已成功的前段不会重新生成。确认继续？')
     ) return
     loading = true
@@ -1129,7 +1141,7 @@
         {#if project.plans.length}
           <button class="secondary-command return-plan-command" disabled={loading} on:click={returnToPlan}>返回已确认文案</button>
         {/if}
-        <button class="approve-command retry-command" disabled={loading} on:click={resumeFailedProject}>从未完成步骤继续</button>
+        <button class="approve-command retry-command" disabled={loading} on:click={resumeFailedProject}>{canRetryComposition ? '重试合成成片（不调用视频模型）' : '从未完成步骤继续'}</button>
         <button class="primary-command retry-command" on:click={reset}>重新制作</button>
       </section>
     {:else}

@@ -3425,9 +3425,9 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
         command.extend(["-i", str(voice_path)])
         filters.append(
             f"[{input_index}:a]apad,atrim=0:{duration:.3f},"
-            f"afade=t=in:st=0:d=0.08,afade=t=out:st={max(duration - 0.12, 0):.3f}:d=0.12[voice]"
+            f"afade=t=in:st=0:d=0.08,afade=t=out:st={max(duration - 0.12, 0):.3f}:d=0.12[voice_source]"
         )
-        audio_label = "voice"
+        audio_label = "voice_source"
         input_index += 1
     if project["bgm_enabled"]:
         bgm_path = resolve_ad_bgm(project.get("bgm_id", "default/ambient"))
@@ -3441,11 +3441,14 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
             )
             if audio_label:
                 filters.append(
-                    "[bgm][voice]sidechaincompress=threshold=0.035:ratio=8:"
+                    "[voice_source]asplit=2[voice_duck][voice_mix]"
+                )
+                filters.append(
+                    "[bgm][voice_duck]sidechaincompress=threshold=0.035:ratio=8:"
                     "attack=15:release=250[ducked_bgm]"
                 )
                 filters.append(
-                    "[voice][ducked_bgm]amix=inputs=2:duration=first:"
+                    "[voice_mix][ducked_bgm]amix=inputs=2:duration=first:"
                     "dropout_transition=1:normalize=0[audio]"
                 )
                 audio_label = "audio"
