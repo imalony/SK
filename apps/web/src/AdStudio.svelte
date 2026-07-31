@@ -117,6 +117,7 @@
     video_provider_id: string
     llm_base_url: string
     llm_model: string
+    llm_api_key_env: string
     llm_api_key_configured: boolean
     llm_api: string
   }
@@ -185,6 +186,7 @@
   let showModelSettings = false
   let settingsBaseUrl = 'https://fjbigmodel.fjdac.cn/v1'
   let settingsModel = 'gpt-5.5'
+  let settingsApiKeyEnv = 'OPENAI_API_KEY2'
   let settingsApiKey = ''
   let llmApiKeyConfigured = false
   let savingModelSettings = false
@@ -344,12 +346,14 @@
           video_provider_id: videoProviderId,
           llm_base_url: settingsBaseUrl,
           llm_model: settingsModel,
+          llm_api_key_env: settingsApiKeyEnv,
           llm_api_key: settingsApiKey || null
         })
       })
       videoProviderId = settings.video_provider_id
       settingsBaseUrl = settings.llm_base_url
       settingsModel = settings.llm_model
+      settingsApiKeyEnv = settings.llm_api_key_env
       llmApiKeyConfigured = settings.llm_api_key_configured
       settingsApiKey = ''
       showModelSettings = false
@@ -805,6 +809,7 @@
       videoProviderId = settings.video_provider_id
       settingsBaseUrl = settings.llm_base_url
       settingsModel = settings.llm_model
+      settingsApiKeyEnv = settings.llm_api_key_env
       llmApiKeyConfigured = settings.llm_api_key_configured
     } catch {
       // The built-in defaults remain usable until settings can be loaded.
@@ -1243,14 +1248,19 @@
             <input bind:value={settingsModel} placeholder="gpt-5.5" />
           </label>
           <label>
-            <span>大模型 API Key</span>
+            <span>API Key 环境变量名</span>
+            <input bind:value={settingsApiKeyEnv} placeholder="OPENAI_API_KEY2" pattern="[A-Za-z_][A-Za-z0-9_]*" spellcheck="false" />
+            <small>例如 `OPENAI_API_KEY2`。后端会读取启动 API 服务时可见的该环境变量；只保存变量名，不保存变量值。</small>
+          </label>
+          <label>
+            <span>大模型 API Key（可选后备）</span>
             <input type="password" bind:value={settingsApiKey} placeholder={llmApiKeyConfigured ? '已配置；留空不会修改' : '输入 API Key'} autocomplete="off" />
-            <small>接口类型固定为 Responses API。密钥仅保存在后端，不会返回到页面。</small>
+            <small>接口类型固定为 Responses API。所选环境变量有值时优先使用；此处仅用于兼容直接配置。</small>
           </label>
         </div>
         <div class="modal-actions">
           <button class="modal-cancel" disabled={savingModelSettings} on:click={() => showModelSettings = false}>取消</button>
-          <button class="approve-command modal-save" disabled={savingModelSettings || !videoProviderId || !settingsBaseUrl.trim() || !settingsModel.trim()} on:click={saveModelSettings}>
+          <button class="approve-command modal-save" disabled={savingModelSettings || !videoProviderId || !settingsBaseUrl.trim() || !settingsModel.trim() || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(settingsApiKeyEnv.trim())} on:click={saveModelSettings}>
             {#if savingModelSettings}<span class="spin"><LoaderCircle size={17} /></span> 正在保存{:else}保存设置{/if}
           </button>
         </div>

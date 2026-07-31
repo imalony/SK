@@ -426,6 +426,12 @@ class UpdateAdModelSettingsRequest(BaseModel):
         default="https://fjbigmodel.fjdac.cn/v1", min_length=8, max_length=500
     )
     llm_model: str = Field(default="gpt-5.5", min_length=1, max_length=200)
+    llm_api_key_env: str = Field(
+        default="OPENAI_API_KEY2",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+    )
     llm_api_key: str | None = Field(default=None, max_length=1000)
 
 
@@ -475,6 +481,12 @@ def set_app_setting(name: str, value: str) -> None:
 
 
 def ad_llm_settings() -> dict[str, str]:
+    api_key_env = get_app_setting(
+        "ad_llm_api_key_env",
+        os.getenv("SK2_AD_LLM_API_KEY_ENV", "OPENAI_API_KEY2"),
+    ).strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+        api_key_env = "OPENAI_API_KEY2"
     return {
         "base_url": get_app_setting(
             "ad_llm_base_url",
@@ -483,8 +495,9 @@ def ad_llm_settings() -> dict[str, str]:
         "model": get_app_setting(
             "ad_llm_model", os.getenv("SK2_AD_LLM_MODEL", "gpt-5.5")
         ),
-        "api_key": get_app_setting("ad_llm_api_key", "")
-        or os.getenv("OPENAI_API_KEY2", "").strip(),
+        "api_key": os.getenv(api_key_env, "").strip()
+        or get_app_setting("ad_llm_api_key", ""),
+        "api_key_env": api_key_env,
         "video_provider_id": get_app_setting(
             "ad_default_video_provider_id", DEFAULT_PROVIDER_ID
         ),
@@ -3992,6 +4005,7 @@ async def get_ad_model_settings() -> dict[str, Any]:
         "video_provider_id": provider_id,
         "llm_base_url": settings["base_url"],
         "llm_model": settings["model"],
+        "llm_api_key_env": settings["api_key_env"],
         "llm_api_key_configured": bool(settings["api_key"]),
         "llm_api": "responses",
     }
@@ -4008,6 +4022,7 @@ async def update_ad_model_settings(
     set_app_setting("ad_default_video_provider_id", provider.id)
     set_app_setting("ad_llm_base_url", request.llm_base_url.strip().rstrip("/"))
     set_app_setting("ad_llm_model", request.llm_model.strip())
+    set_app_setting("ad_llm_api_key_env", request.llm_api_key_env.strip())
     if request.llm_api_key and request.llm_api_key.strip():
         set_app_setting("ad_llm_api_key", request.llm_api_key.strip())
     return await get_ad_model_settings()
