@@ -7,7 +7,6 @@ param(
 $ErrorActionPreference = "Stop"
 
 $rootDir = $PSScriptRoot
-$runtimeDir = Join-Path $rootDir ".runtime"
 $comfyRuntime = "F:\SK2-runtime\ComfyUI_windows_portable"
 $comfyPython = Join-Path $comfyRuntime "python_embeded\python.exe"
 $comfyMain = Join-Path $comfyRuntime "ComfyUI\main.py"
@@ -41,8 +40,6 @@ if (Test-Path $envFile) {
     Write-Host "Loaded local environment variables from .env."
 }
 
-New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
-
 function Test-ListeningPort {
     param([int]$Port)
 
@@ -66,7 +63,13 @@ function Wait-ForPort {
     throw "$Name did not start on port $Port within $TimeoutSeconds seconds."
 }
 
-function Start-BackgroundService {
+function ConvertTo-PowerShellLiteral {
+    param([string]$Value)
+
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Start-VisibleService {
     param(
         [string]$Name,
         [int]$Port,
@@ -81,14 +84,29 @@ function Start-BackgroundService {
         return
     }
 
-    Write-Host "Starting $Name..."
+    $quotedFilePath = ConvertTo-PowerShellLiteral -Value $FilePath
+    $quotedArguments = @(
+        $ArgumentList | ForEach-Object {
+            ConvertTo-PowerShellLiteral -Value $_
+        }
+    ) -join ", "
+    $quotedTitle = ConvertTo-PowerShellLiteral -Value "SK2 - $Name"
+    $command = "`$host.UI.RawUI.WindowTitle = $quotedTitle; & $quotedFilePath @($quotedArguments)"
+    $encodedCommand = [Convert]::ToBase64String(
+        [Text.Encoding]::Unicode.GetBytes($command)
+    )
+
+    Write-Host "Starting $Name in a visible PowerShell window..."
     Start-Process `
-        -FilePath $FilePath `
-        -ArgumentList $ArgumentList `
+        -FilePath "powershell.exe" `
+        -ArgumentList @(
+            "-NoLogo",
+            "-NoExit",
+            "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", $encodedCommand
+        ) `
         -WorkingDirectory $WorkingDirectory `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput (Join-Path $runtimeDir "$Name.stdout.log") `
-        -RedirectStandardError (Join-Path $runtimeDir "$Name.stderr.log")
+        -WindowStyle Normal
     Wait-ForPort -Name $Name -Port $Port -TimeoutSeconds $StartupTimeoutSeconds
 }
 
@@ -115,7 +133,7 @@ if ($selectedServices -contains "4") {
             }
             $ollamaPath = $ollamaCommand.Source
         }
-        Start-BackgroundService `
+        Start-VisibleService `
             -Name "ollama" `
             -Port 11434 `
             -FilePath $ollamaPath `
@@ -131,7 +149,7 @@ if ($selectedServices -contains "3") {
     if (-not (Test-Path $comfyPython)) {
         throw "ComfyUI Python was not found: $comfyPython"
     }
-    Start-BackgroundService `
+    Start-VisibleService `
         -Name "comfyui" `
         -Port 8188 `
         -FilePath $comfyPython `
@@ -147,7 +165,7 @@ if ($selectedServices -contains "3") {
 }
 
 if ($selectedServices -contains "1") {
-    Start-BackgroundService `
+    Start-VisibleService `
         -Name "api" `
         -Port 8000 `
         -FilePath $apiPython `
@@ -160,7 +178,7 @@ if ($selectedServices -contains "2") {
     if ($null -eq $npmCommand) {
         throw "npm.cmd was not found. Install Node.js before starting the frontend."
     }
-    Start-BackgroundService `
+    Start-VisibleService `
         -Name "web" `
         -Port 5173 `
         -FilePath $npmCommand.Source `
@@ -185,7 +203,7 @@ if ($selectedServices -contains "2") {
     Write-Host "SK2 Advertising Studio: http://127.0.0.1:5173/"
     Write-Host "Technical test workspace: http://127.0.0.1:5173/test"
 }
-Write-Host "Keep this window open to view startup messages. Closing it does not stop background services."
+Write-Host "Each selected service is running in its own visible PowerShell window. Close that service window to stop it."
 if ($OpenBrowser -and ($selectedServices -contains "2")) {
     Start-Process "http://127.0.0.1:5173"
 }
