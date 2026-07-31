@@ -1965,9 +1965,22 @@ async def run_generation(generation_id: str) -> None:
                         if not history:
                             continue
                         status = history.get("status", {})
+                        status_str = str(status.get("status_str") or "").lower()
+                        if status_str in {"error", "failed", "cancelled", "canceled"}:
+                            messages = status.get("messages")
+                            if isinstance(messages, list):
+                                details = "\n".join(
+                                    " ".join(str(part) for part in message)
+                                    if isinstance(message, list)
+                                    else str(message)
+                                    for message in messages
+                                )
+                            else:
+                                details = str(messages or "ComfyUI failed")
+                            raise RuntimeError(f"ComfyUI {status_str}: {details}")
                         if not status.get("completed"):
                             continue
-                        if status.get("status_str") != "success":
+                        if status_str != "success":
                             raise RuntimeError(str(status.get("messages", "ComfyUI failed")))
 
                         output = history.get("outputs", {}).get("11") or history.get(
