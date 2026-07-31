@@ -14,6 +14,9 @@ Return JSON only:
   "transition_prompt": "..."
 }
 
+transition_type must be exactly one of: direct_continuation, match_cut, flash,
+occlusion, hard_cut. All boolean fields must be JSON booleans, never strings.
+
 Use continuation when it preserves a product, person, setting, camera motion,
 or an ongoing action. If the planned next segment needs a new scene, use an
 independent cut and set should_continue to false. In that case, write a

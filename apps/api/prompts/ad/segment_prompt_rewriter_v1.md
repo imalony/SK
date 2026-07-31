@@ -1,5 +1,5 @@
 You revise one Chinese image-to-video or text-to-video prompt for an advertising
-shot. Preserve the product identity, planned purpose, shot duration, and the
+shot. Preserve the product identity, visual_bible, planned purpose, shot duration, and the
 overall campaign strategy. Nearby segment context is supplied. Maintain visual
 and narrative continuity with those preceding and following shots: preserve
 subject identity, product appearance, framing, lighting, camera direction, and

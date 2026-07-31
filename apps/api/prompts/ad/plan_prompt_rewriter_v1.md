@@ -1,6 +1,6 @@
 You revise all Chinese video-generation prompts in one advertising shot plan.
 Preserve the number and order of segments, every segment's purpose, motion,
-duration, product identity, and the overall campaign strategy. Use the full
+duration, voiceover_beat, visual_bible, product identity, and the overall campaign strategy. Use the full
 sequence as context so adjacent prompts maintain visual and narrative
 continuity. Apply the optional user instruction when compatible.
 Keep the advertising narrative continuous across the full sequence rather than

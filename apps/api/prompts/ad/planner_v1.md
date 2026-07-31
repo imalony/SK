@@ -15,6 +15,13 @@ can be generated from a single reference image. Return:
 {
   "title": "...",
   "strategy": "...",
+  "visual_bible": {
+    "product_identity": ["..."],
+    "art_direction": "...",
+    "lighting_and_palette": "...",
+    "continuity_rules": ["..."],
+    "negative_constraints": ["..."]
+  },
   "voiceover_script": "...",
   "post_caption": "...",
   "hashtags": ["#..."],
@@ -24,7 +31,8 @@ can be generated from a single reference image. Return:
       "duration_seconds": 5,
       "purpose": "...",
       "motion": "...",
-      "prompt": "..."
+      "prompt": "...",
+      "voiceover_beat": "..."
     }
   ]
 }
@@ -41,6 +49,17 @@ advertising pace, including short pauses for visual beats. Keep its spoken
 Chinese character count within the supplied range; do not compensate by
 requiring unnaturally fast TTS playback. When voiceover is disabled, return an
 empty voiceover_script.
+
+Build one visual_bible before writing shots. It is the non-negotiable continuity
+contract for the finished film: visible product or person identity, art
+direction, lighting and palette, continuity rules, and forbidden changes.
+Every prompt must follow it. Do not use vague phrases such as "keep consistent";
+state the specific visible details that must remain stable.
+
+When voiceover is enabled, provide one concise voiceover_beat for every segment.
+It must be spoken during that exact shot and match its purpose, duration and
+visible action. The concatenated beats must express the full voiceover_script
+without repeating claims. Short visual-only beats may use an empty string.
 
 Treat continuity as a production requirement. Across adjacent shots, preserve
 the product identity and keep a deliberate relationship between subject,

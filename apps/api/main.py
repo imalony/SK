@@ -20,7 +20,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -394,6 +394,30 @@ class AdFinalEditRequest(BaseModel):
 
 class AdFinalCopyRequest(BaseModel):
     instruction: str = Field(default="", max_length=1000)
+
+
+class AdSegmentReview(BaseModel):
+    approved: bool
+    reason: str = Field(min_length=1, max_length=1000)
+    preserve: list[str] = Field(default_factory=list, max_length=12)
+    should_continue: bool
+    continue_reason: str = Field(default="", max_length=1000)
+    continuation_prompt: str = Field(min_length=5, max_length=3000)
+    retry_prompt: str = Field(min_length=5, max_length=3000)
+
+
+class AdTransitionDecision(BaseModel):
+    should_continue: bool
+    transition_type: Literal[
+        "direct_continuation",
+        "match_cut",
+        "flash",
+        "occlusion",
+        "hard_cut",
+    ] = "hard_cut"
+    reason: str = Field(default="", max_length=500)
+    preserve: list[str] = Field(default_factory=list, max_length=8)
+    transition_prompt: str = Field(min_length=5, max_length=3000)
 
 
 class UpdateAdModelSettingsRequest(BaseModel):
@@ -835,15 +859,51 @@ async def request_ad_llm(
         raise RuntimeError(f"Advertising language model is unavailable: {error}") from error
 
 
-def ad_segment_count(duration_seconds: int) -> int:
+def ad_segment_count(duration_seconds: int, *, minimum_seconds: int = 2) -> int:
     """Keep local video jobs in short, reliable clips."""
-    return max(1, min(24, (duration_seconds + 4) // 5))
+    preferred_seconds = max(5, minimum_seconds)
+    preferred_count = (duration_seconds + preferred_seconds - 1) // preferred_seconds
+    feasible_count = max(1, duration_seconds // minimum_seconds)
+    return max(1, min(24, preferred_count, feasible_count))
 
 
-def ad_video_frame_count(duration_seconds: float, fps: int = 8) -> int:
-    """Match a Wan segment to its planned duration using Wan's 4n + 1 frame rule."""
-    desired_frames = max(17, min(81, int(round(duration_seconds * fps))))
-    return max(17, min(81, ((desired_frames - 1 + 3) // 4) * 4 + 1))
+def provider_frame_spec(provider: VideoProvider) -> tuple[int, int, int]:
+    if provider.kind != "comfyui":
+        maximum_seconds = int(provider.settings.get("duration_max_seconds", 15))
+        return 1, 1, max(1, maximum_seconds * provider_default_fps(provider))
+    default_alignment = 8 if "ltx" in provider.id else 4
+    return (
+        max(1, int(provider.settings.get("frame_alignment", default_alignment))),
+        max(1, int(provider.settings.get("min_frames", 9 if default_alignment == 8 else 17))),
+        max(1, int(provider.settings.get("max_frames", 81))),
+    )
+
+
+def ad_video_frame_count(
+    duration_seconds: float, fps: int, provider: VideoProvider
+) -> int:
+    """Fit a requested segment to the selected provider's latent frame rule."""
+    alignment, minimum, maximum = provider_frame_spec(provider)
+    desired_frames = max(minimum, min(maximum, int(round(duration_seconds * fps))))
+    if alignment == 1:
+        return desired_frames
+    return max(
+        minimum,
+        min(maximum, ((desired_frames - 1 + alignment - 1) // alignment) * alignment + 1),
+    )
+
+
+def ad_segment_duration_bounds(
+    provider: VideoProvider, fps: int
+) -> tuple[int, int, float]:
+    _, minimum_frames, maximum_frames = provider_frame_spec(provider)
+    minimum_seconds = max(2, int((minimum_frames + fps - 1) // fps))
+    maximum_seconds = max(
+        minimum_seconds,
+        int(provider.settings.get("planned_segment_max_seconds", 15)),
+    )
+    native_clip_seconds = maximum_frames / max(fps, 1)
+    return minimum_seconds, maximum_seconds, native_clip_seconds
 
 
 def ad_voiceover_duration_guidance(duration_seconds: int) -> dict[str, Any]:
@@ -901,7 +961,13 @@ def split_ad_duration(duration_seconds: int, segment_count: int) -> list[int]:
     return [base + (1 if index < remainder else 0) for index in range(segment_count)]
 
 
-def rebalance_ad_durations(durations: list[int], target_duration: int) -> list[int]:
+def rebalance_ad_durations(
+    durations: list[int],
+    target_duration: int,
+    *,
+    minimum_seconds: int = 2,
+    maximum_seconds: int = 15,
+) -> list[int]:
     """Preserve the planner's pacing while making the total duration exact."""
     if not durations:
         return []
@@ -910,20 +976,29 @@ def rebalance_ad_durations(durations: list[int], target_duration: int) -> list[i
         return split_ad_duration(target_duration, len(durations))
 
     balanced = [
-        max(2, min(15, int(round(value * target_duration / source_total))))
+        max(
+            minimum_seconds,
+            min(maximum_seconds, int(round(value * target_duration / source_total))),
+        )
         for value in durations
     ]
     difference = target_duration - sum(balanced)
     while difference:
         if difference > 0:
-            candidates = [index for index, value in enumerate(balanced) if value < 15]
+            candidates = [
+                index for index, value in enumerate(balanced)
+                if value < maximum_seconds
+            ]
             if not candidates:
                 break
             index = max(candidates, key=lambda item: (durations[item], -item))
             balanced[index] += 1
             difference -= 1
         else:
-            candidates = [index for index, value in enumerate(balanced) if value > 2]
+            candidates = [
+                index for index, value in enumerate(balanced)
+                if value > minimum_seconds
+            ]
             if not candidates:
                 break
             index = max(candidates, key=lambda item: (balanced[item], durations[item], -item))
@@ -932,14 +1007,99 @@ def rebalance_ad_durations(durations: list[int], target_duration: int) -> list[i
     return balanced
 
 
+def normalize_ad_visual_bible(value: Any) -> dict[str, list[str] | str]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "product_identity": [
+            str(item).strip()[:240]
+            for item in raw.get("product_identity", [])
+            if str(item).strip()
+        ][:8],
+        "art_direction": str(raw.get("art_direction", "")).strip()[:800],
+        "lighting_and_palette": str(raw.get("lighting_and_palette", "")).strip()[:800],
+        "continuity_rules": [
+            str(item).strip()[:240]
+            for item in raw.get("continuity_rules", [])
+            if str(item).strip()
+        ][:8],
+        "negative_constraints": [
+            str(item).strip()[:240]
+            for item in raw.get("negative_constraints", [])
+            if str(item).strip()
+        ][:8],
+    }
+
+
+def visual_bible_prompt(plan: dict[str, Any]) -> str:
+    bible = normalize_ad_visual_bible(plan.get("visual_bible"))
+    parts = [
+        "全片视觉圣经（必须遵守）：",
+        f"产品身份：{'；'.join(bible['product_identity']) or '以参考素材可见外观为唯一依据'}。",
+        f"美术方向：{bible['art_direction'] or '统一为精致竖屏广告质感'}。",
+        f"光色：{bible['lighting_and_palette'] or '保持相邻镜头光向、色温和对比度连续'}。",
+        f"连续性：{'；'.join(bible['continuity_rules']) or '主体比例、屏幕方向和镜头能量连续'}。",
+        f"禁止变化：{'；'.join(bible['negative_constraints']) or '不得改变包装、人物身份、品牌资产或生成文字水印'}。",
+    ]
+    return "\n".join(parts)
+
+
+def ad_generation_prompt(plan: dict[str, Any], shot_prompt: str) -> str:
+    return (
+        f"{visual_bible_prompt(plan)}\n"
+        f"本镜头执行提示：{shot_prompt.strip()}"
+    )[:4000]
+
+
+def voiceover_beats_for_segments(
+    script: str, segments: list[dict[str, Any]]
+) -> list[str]:
+    if not script.strip():
+        return ["" for _ in segments]
+    sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[。！？!?；;])", script)
+        if item.strip()
+    ] or [script.strip()]
+    beats = ["" for _ in segments]
+    total_duration = sum(float(item.get("duration_seconds", 0)) for item in segments) or 1
+    sentence_total = sum(len(item) for item in sentences) or 1
+    sentence_index = 0
+    sentence_cursor = 0
+    for index, segment in enumerate(segments):
+        slot_budget = (
+            sentence_total * float(segment.get("duration_seconds", 0)) / total_duration
+        )
+        chunk: list[str] = []
+        while sentence_index < len(sentences) and (
+            not chunk or sentence_cursor + len(sentences[sentence_index]) <= slot_budget
+        ):
+            current = sentences[sentence_index]
+            chunk.append(current)
+            sentence_cursor += len(current)
+            sentence_index += 1
+        beats[index] = "".join(chunk)
+        sentence_cursor = max(0, sentence_cursor - slot_budget)
+    if sentence_index < len(sentences):
+        beats[-1] += "".join(sentences[sentence_index:])
+    return beats
+
+
 def fallback_ad_plan(project: dict[str, Any], asset_count: int) -> dict[str, Any]:
     duration = int(project["target_duration_seconds"])
-    segment_count = ad_segment_count(duration)
+    provider = get_provider(project.get("video_provider_id", DEFAULT_PROVIDER_ID))
+    fps = provider_fps(provider, int(project.get("video_fps") or 8))
+    minimum_seconds, maximum_seconds, _ = ad_segment_duration_bounds(provider, fps)
+    segment_count = ad_segment_count(duration, minimum_seconds=minimum_seconds)
     pacing_template = [
         3 if index == 0 else 6 if index < segment_count - 1 else 5
         for index in range(segment_count)
     ]
-    segment_durations = rebalance_ad_durations(pacing_template, duration)
+    segment_durations = rebalance_ad_durations(
+        pacing_template,
+        duration,
+        minimum_seconds=minimum_seconds,
+        maximum_seconds=maximum_seconds,
+    )
     segments = []
     for index in range(segment_count):
         segments.append(
@@ -948,6 +1108,7 @@ def fallback_ad_plan(project: dict[str, Any], asset_count: int) -> dict[str, Any
                 "duration_seconds": segment_durations[index],
                 "purpose": "展示核心卖点" if index else "建立产品印象",
                 "motion": "gentle product push-in with clean commercial lighting",
+                "voiceover_beat": "",
                 "prompt": (
                     "竖屏商品广告视频，严格保留参考图中的商品外观与包装细节，镜头缓慢推进，高级自然光，干净背景，动作真实稳定，无文字，无水印。"
                     if asset_count
@@ -955,15 +1116,27 @@ def fallback_ad_plan(project: dict[str, Any], asset_count: int) -> dict[str, Any
                 ),
             }
         )
-    return {
+    plan = {
         "title": "商品短视频广告",
         "strategy": "以最有表现力的素材建立第一印象，并按叙事需要穿插卖点、氛围和行动引导。",
         "voiceover_script": "好看更好用，细节看得见。现在就来了解这款产品。",
         "post_caption": "把日常的好选择，分享给更多人。",
         "hashtags": ["#好物推荐", "#抖音广告", "#品质生活"],
         "segments": segments,
+        "visual_bible": {
+            "product_identity": ["严格保留参考素材中可见的商品、包装或人物特征"],
+            "art_direction": "干净、克制、真实的竖屏商品广告",
+            "lighting_and_palette": "相邻镜头保持同一色温、光向和对比度",
+            "continuity_rules": ["同一主体保持比例、屏幕方向和镜头能量连续"],
+            "negative_constraints": ["不得生成文字、商标、水印或改变产品包装"],
+        },
         "warning": "云端文案模型暂不可用，已使用基础方案。确认前可继续修改。",
     }
+    for segment, beat in zip(
+        plan["segments"], voiceover_beats_for_segments(plan["voiceover_script"], segments)
+    ):
+        segment["voiceover_beat"] = beat
+    return plan
 
 
 def normalize_ad_plan(plan: dict[str, Any], project: dict[str, Any], asset_count: int) -> dict[str, Any]:
@@ -972,7 +1145,10 @@ def normalize_ad_plan(plan: dict[str, Any], project: dict[str, Any], asset_count
     if not isinstance(raw_segments, list) or not raw_segments:
         return fallback_ad_plan(project, asset_count)
     normalized: list[dict[str, Any]] = []
-    desired_segment_count = ad_segment_count(target)
+    provider = get_provider(project.get("video_provider_id", DEFAULT_PROVIDER_ID))
+    fps = provider_fps(provider, int(project.get("video_fps") or 8))
+    minimum_seconds, maximum_seconds, _ = ad_segment_duration_bounds(provider, fps)
+    desired_segment_count = ad_segment_count(target, minimum_seconds=minimum_seconds)
     for index, item in enumerate(raw_segments[:desired_segment_count]):
         if not isinstance(item, dict):
             continue
@@ -987,10 +1163,17 @@ def normalize_ad_plan(plan: dict[str, Any], project: dict[str, Any], asset_count
                     if asset_count and -1 <= requested_asset_index < asset_count
                     else -1
                 ),
-                "duration_seconds": max(2, min(15, int(round(float(item.get("duration_seconds", 4)))))),
+                "duration_seconds": max(
+                    minimum_seconds,
+                    min(
+                        maximum_seconds,
+                        int(round(float(item.get("duration_seconds", 4)))),
+                    ),
+                ),
                 "purpose": str(item.get("purpose", "展示产品卖点"))[:300],
                 "motion": str(item.get("motion", "gentle camera movement"))[:500],
                 "prompt": str(item.get("prompt", ""))[:3000],
+                "voiceover_beat": str(item.get("voiceover_beat", "")).strip()[:500],
             }
         )
     if not normalized:
@@ -999,12 +1182,20 @@ def normalize_ad_plan(plan: dict[str, Any], project: dict[str, Any], asset_count
     # A local generation segment should remain short. If the planner returns too
     # few shots for the requested duration, use the deterministic fallback rather
     # than silently creating an impractically long final shot.
-    minimum_segment_count = max(1, (target + 7) // 8)
+    minimum_segment_count = max(1, (target + maximum_seconds - 1) // maximum_seconds)
     if len(normalized) < minimum_segment_count:
         return fallback_ad_plan(project, asset_count)
 
     planned_durations = [item["duration_seconds"] for item in normalized]
-    for item, seconds in zip(normalized, rebalance_ad_durations(planned_durations, target)):
+    for item, seconds in zip(
+        normalized,
+        rebalance_ad_durations(
+            planned_durations,
+            target,
+            minimum_seconds=minimum_seconds,
+            maximum_seconds=maximum_seconds,
+        ),
+    ):
         item["duration_seconds"] = seconds
     plan["segments"] = normalized
     plan["title"] = str(plan.get("title", "商品短视频广告"))[:120]
@@ -1012,6 +1203,17 @@ def normalize_ad_plan(plan: dict[str, Any], project: dict[str, Any], asset_count
     plan["voiceover_script"] = str(plan.get("voiceover_script", ""))[:2000]
     plan["post_caption"] = str(plan.get("post_caption", ""))[:1000]
     plan["hashtags"] = [str(value)[:80] for value in plan.get("hashtags", []) if str(value).strip()][:10]
+    plan["visual_bible"] = normalize_ad_visual_bible(plan.get("visual_bible"))
+    if project["voice_enabled"] and not any(
+        segment["voiceover_beat"] for segment in normalized
+    ):
+        for segment, beat in zip(
+            normalized, voiceover_beats_for_segments(plan["voiceover_script"], normalized)
+        ):
+            segment["voiceover_beat"] = beat
+    if not project["voice_enabled"]:
+        for segment in normalized:
+            segment["voiceover_beat"] = ""
     return plan
 
 
@@ -1111,6 +1313,38 @@ def ad_project_detail(project_id: str) -> dict[str, Any]:
         for row in final_versions
     ]
     return result
+
+
+def completed_ad_segments_for_plan(
+    project: dict[str, Any], plan_record: dict[str, Any]
+) -> list[dict[str, Any]]:
+    replan_from_sequence = int(
+        plan_record.get("replan_from_sequence")
+        or plan_record.get("plan", {}).get("replan_from_sequence")
+        or 0
+    )
+    selected: dict[int, dict[str, Any]] = {}
+    for segment in project["segments"]:
+        if segment.get("status") != "succeeded" or not segment.get("output_path"):
+            continue
+        sequence = int(segment["sequence_number"])
+        is_current_plan = segment.get("plan_id") == plan_record["id"]
+        is_reused_prefix = replan_from_sequence and sequence < replan_from_sequence
+        if not (is_current_plan or is_reused_prefix):
+            continue
+        existing = selected.get(sequence)
+        if existing is None or int(segment.get("retry_count") or 0) >= int(
+            existing.get("retry_count") or 0
+        ):
+            selected[sequence] = segment
+    expected_sequences = range(1, len(plan_record["plan"].get("segments", [])) + 1)
+    missing = [sequence for sequence in expected_sequences if sequence not in selected]
+    if missing:
+        raise RuntimeError(
+            "Completed video segments are missing for approved plan sequences: "
+            + ", ".join(str(sequence) for sequence in missing)
+        )
+    return [selected[sequence] for sequence in expected_sequences]
 
 
 async def broadcast_ad_project(project_id: str) -> None:
@@ -2199,7 +2433,7 @@ def extract_ad_keyframes(source: Path, target_dir: Path) -> list[Path]:
     for existing_frame in target_dir.glob("frame-*.jpg"):
         existing_frame.unlink()
     duration = max(probe_video_duration(source), 0.1)
-    timestamps = [0.0, duration * 0.5, duration * 0.8]
+    timestamps = [0.0, duration * 0.5, duration * 0.8, max(0.0, duration - 0.04)]
     frames: list[Path] = []
     for index, timestamp in enumerate(timestamps, start=1):
         frame_path = target_dir / f"frame-{index:02d}.jpg"
@@ -2350,6 +2584,8 @@ def normalize_ad_clip(
     width: int,
     height: int,
     fps: int | None,
+    duration_seconds: float | None = None,
+    transition_tail_seconds: float = 0.0,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     filters: list[str] = []
@@ -2359,6 +2595,13 @@ def normalize_ad_clip(
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
     )
+    if duration_seconds is not None:
+        filters.append(f"trim=duration={max(0.1, duration_seconds):.3f}")
+        filters.append("setpts=PTS-STARTPTS")
+    if transition_tail_seconds > 0:
+        filters.append(
+            f"tpad=stop_mode=clone:stop_duration={transition_tail_seconds:.3f}"
+        )
     result = subprocess.run(
         [
             ffmpeg_executable(),
@@ -2409,62 +2652,241 @@ def ad_output_settings(project: dict[str, Any]) -> tuple[int, int, int | None]:
     return width, height, None
 
 
-def concat_ad_clips(clips: list[Path], target: Path, work_dir: Path) -> None:
+def ad_transition_specs(
+    project: dict[str, Any], clips: list[Path]
+) -> list[dict[str, Any]]:
+    by_output_path: dict[str, dict[str, Any]] = {}
+    for segment in project["segments"]:
+        if segment.get("status") != "succeeded" or not segment.get("output_path"):
+            continue
+        existing = by_output_path.get(segment["output_path"])
+        if existing is None or int(segment.get("retry_count") or 0) >= int(
+            existing.get("retry_count") or 0
+        ):
+            by_output_path[segment["output_path"]] = segment
+    specs: list[dict[str, Any]] = []
+    for clip in clips[1:]:
+        try:
+            relative_path = clip.relative_to(MEDIA_DIR).as_posix()
+        except ValueError:
+            relative_path = ""
+        review = (by_output_path.get(relative_path) or {}).get("review") or {}
+        transition = review.get("incoming_transition")
+        if not isinstance(transition, dict):
+            transition = {}
+        transition_type = str(transition.get("transition_type", "hard_cut"))
+        if transition_type not in {
+            "direct_continuation",
+            "match_cut",
+            "flash",
+            "occlusion",
+            "hard_cut",
+        }:
+            transition_type = "hard_cut"
+        specs.append(
+            {
+                "type": transition_type,
+                "reason": str(transition.get("reason", ""))[:500],
+            }
+        )
+    return specs
+
+
+def ad_transition_overlap(
+    transition_type: str, previous_duration: float, next_duration: float
+) -> float:
+    preferred = {
+        "direct_continuation": 0.12,
+        "match_cut": 0.16,
+        "flash": 0.12,
+        "occlusion": 0.18,
+    }.get(transition_type)
+    if preferred is None:
+        return 0.0
+    return min(preferred, previous_duration / 3, next_duration / 3)
+
+
+def ad_timeline_segment_durations(
+    source_paths: list[Path],
+    transitions: list[dict[str, Any]],
+    target_durations: list[float] | None = None,
+) -> list[float]:
+    durations = target_durations or [
+        max(0.1, probe_video_duration(path)) for path in source_paths
+    ]
+    effective = list(durations)
+    if target_durations is not None:
+        return effective
+    for index, transition in enumerate(transitions):
+        if index + 1 >= len(durations):
+            break
+        effective[index] -= ad_transition_overlap(
+            str(transition.get("type", "hard_cut")),
+            durations[index],
+            durations[index + 1],
+        )
+    return effective
+
+
+def ad_segment_records_for_source_paths(
+    project: dict[str, Any], source_paths: list[Path]
+) -> list[dict[str, Any] | None]:
+    by_output_path: dict[str, dict[str, Any]] = {}
+    for segment in project["segments"]:
+        if segment.get("status") != "succeeded" or not segment.get("output_path"):
+            continue
+        existing = by_output_path.get(segment["output_path"])
+        if existing is None or int(segment.get("retry_count") or 0) >= int(
+            existing.get("retry_count") or 0
+        ):
+            by_output_path[segment["output_path"]] = segment
+    records: list[dict[str, Any] | None] = []
+    for path in source_paths:
+        try:
+            records.append(by_output_path.get(path.relative_to(MEDIA_DIR).as_posix()))
+        except ValueError:
+            records.append(None)
+    return records
+
+
+def concat_ad_clips(
+    clips: list[Path],
+    target: Path,
+    work_dir: Path,
+    transitions: list[dict[str, Any]] | None = None,
+) -> None:
     if not clips:
         raise RuntimeError("No video clips are available for composition")
-    manifest = work_dir / "clips.txt"
-    lines = []
-    for path in clips:
-        escaped_path = path.as_posix().replace("'", r"'\''")
-        lines.append(f"file '{escaped_path}'")
-    manifest.write_text("\n".join(lines), encoding="utf-8")
-    result = subprocess.run(
+    transitions = transitions or []
+    if len(transitions) < len(clips) - 1:
+        transitions = [
+            *transitions,
+            *({"type": "hard_cut"} for _ in range(len(clips) - 1 - len(transitions))),
+        ]
+    if all(item.get("type") == "hard_cut" for item in transitions):
+        manifest = work_dir / "clips.txt"
+        lines = []
+        for path in clips:
+            escaped_path = path.as_posix().replace("'", r"'\''")
+            lines.append(f"file '{escaped_path}'")
+        manifest.write_text("\n".join(lines), encoding="utf-8")
+        result = subprocess.run(
+            [
+                ffmpeg_executable(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(manifest),
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not join ad clips: {result.stderr[-500:]}")
+        return
+
+    transition_filters = {
+        "direct_continuation": ("fade", 0.12),
+        "match_cut": ("fade", 0.16),
+        "flash": ("fadewhite", 0.12),
+        "occlusion": ("circleopen", 0.18),
+    }
+    durations = [max(0.1, probe_video_duration(path)) for path in clips]
+    command = [ffmpeg_executable(), "-y"]
+    for clip in clips:
+        command.extend(["-i", str(clip)])
+    filters = ["[0:v]setpts=PTS-STARTPTS[v0]"]
+    accumulated_duration = durations[0]
+    previous_label = "v0"
+    for index in range(1, len(clips)):
+        current_label = f"clip{index}"
+        output_label = f"v{index}"
+        filters.append(f"[{index}:v]setpts=PTS-STARTPTS[{current_label}]")
+        transition_type = str(transitions[index - 1].get("type", "hard_cut"))
+        if transition_type in transition_filters:
+            effect, _ = transition_filters[transition_type]
+            overlap = ad_transition_overlap(
+                transition_type, accumulated_duration, durations[index]
+            )
+            filters.append(
+                f"[{previous_label}][{current_label}]xfade=transition={effect}:"
+                f"duration={overlap:.3f}:offset={max(0, accumulated_duration - overlap):.3f}"
+                f"[{output_label}]"
+            )
+            accumulated_duration += durations[index] - overlap
+        else:
+            filters.append(
+                f"[{previous_label}][{current_label}]concat=n=2:v=1:a=0[{output_label}]"
+            )
+            accumulated_duration += durations[index]
+        previous_label = output_label
+    command.extend(
         [
-            ffmpeg_executable(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(manifest),
-            "-c",
-            "copy",
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{previous_label}]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
             "-movflags",
             "+faststart",
             str(target),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+        ]
     )
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        raise RuntimeError(f"Could not join ad clips: {result.stderr[-500:]}")
+        raise RuntimeError(f"Could not render ad transitions: {result.stderr[-500:]}")
 
 
 def ass_timestamp(seconds: float) -> str:
     return f"{int(seconds // 3600)}:{int(seconds % 3600 // 60):02d}:{seconds % 60:05.2f}"
 
 
-def write_ad_subtitles(script: str, duration: float, target: Path) -> None:
-    sentences = [item.strip() for item in re.split(r"(?<=[。！？!?；;])", script) if item.strip()]
-    total = sum(len(item) for item in sentences) or 1
+def write_ad_subtitles(
+    beats: list[str],
+    segment_durations: list[float],
+    target: Path,
+    *,
+    width: int,
+    height: int,
+) -> None:
     cursor = 0.0
     events: list[str] = []
-    for item in sentences:
-        end = min(duration, cursor + duration * len(item) / total)
+    for item, duration in zip(beats, segment_durations):
+        end = cursor + max(0.0, duration)
+        if not item.strip():
+            cursor = end
+            continue
         escaped = item.replace("{", "(").replace("}", ")").replace("\n", r"\N")
         events.append(f"Dialogue: 0,{ass_timestamp(cursor)},{ass_timestamp(end)},Default,,0,0,0,,{escaped}")
         cursor = end
+    font_size = max(22, round(height * 0.05))
+    margin_vertical = max(48, round(height * 0.078))
+    margin_horizontal = max(28, round(width * 0.05))
     target.write_text(
-        """[Script Info]
+        f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {width}
+PlayResY: {height}
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Default,Microsoft YaHei,54,&H00FFFFFF,&H000000FF,&H00101010,&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,56,56,150,1
+Style: Default,Microsoft YaHei,{font_size},&H00FFFFFF,&H000000FF,&H00101010,&H80000000,1,0,0,0,100,100,0,0,1,3,1,2,{margin_horizontal},{margin_horizontal},{margin_vertical},1
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
@@ -2472,6 +2894,79 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
         + "\n".join(events),
         encoding="utf-8",
     )
+
+
+async def render_ad_voiceover_track(
+    project_dir: Path,
+    *,
+    beats: list[str],
+    segment_durations: list[float],
+    voice_id: str,
+) -> Path | None:
+    if not any(item.strip() for item in beats):
+        return None
+    raw_paths: list[Path | None] = []
+    for index, beat in enumerate(beats, start=1):
+        if not beat.strip():
+            raw_paths.append(None)
+            continue
+        source = project_dir / f"voice-beat-{index:02d}.mp3"
+        await edge_tts.Communicate(beat, voice=voice_id).save(str(source))
+        raw_paths.append(source)
+
+    command = [ffmpeg_executable(), "-y"]
+    input_indexes: list[int | None] = []
+    for source in raw_paths:
+        if source is None:
+            input_indexes.append(None)
+            continue
+        input_indexes.append(len([item for item in input_indexes if item is not None]))
+        command.extend(["-i", str(source)])
+    filters: list[str] = []
+    labels: list[str] = []
+    for index, (source, input_index, duration) in enumerate(
+        zip(raw_paths, input_indexes, segment_durations)
+    ):
+        label = f"voice{index}"
+        labels.append(label)
+        if source is None or input_index is None:
+            filters.append(
+                f"anullsrc=r=48000:cl=stereo,atrim=0:{max(0.05, duration):.3f}[{label}]"
+            )
+            continue
+        source_duration = await asyncio.to_thread(probe_video_duration, source)
+        tempo = min(1.45, max(0.72, source_duration / max(duration, 0.1)))
+        fade_out_start = max(duration - 0.08, 0)
+        filters.append(
+            f"[{input_index}:a]atempo={tempo:.4f},apad,atrim=0:{duration:.3f},"
+            f"afade=t=in:st=0:d=0.05,afade=t=out:st={fade_out_start:.3f}:d=0.08"
+            f"[{label}]"
+        )
+    output = project_dir / "voice-track.m4a"
+    filters.append(f"{''.join(f'[{label}]' for label in labels)}concat=n={len(labels)}:v=0:a=1[voice]")
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[voice]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            str(output),
+        ]
+    )
+    result = await asyncio.to_thread(
+        subprocess.run,
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not render timed advertising voiceover: {result.stderr[-500:]}")
+    return output
 
 
 def ad_bgm_directory() -> Path:
@@ -2543,21 +3038,15 @@ async def review_ad_segment(
         ensure_ascii=False,
     )
     try:
-        return await request_ad_llm(
+        raw_review = await request_ad_llm(
             system_prompt=load_ad_prompt("segment_reviewer_v1.md"),
             user_prompt=user_prompt,
             image_paths=frames,
         )
-    except RuntimeError as error:
-        return {
-            "approved": True,
-            "reason": f"Review fallback: {error}",
-            "preserve": ["商品主体", "构图", "光线"],
-            "should_continue": current_duration_seconds + 0.25 < float(segment["duration_seconds"]),
-            "continue_reason": "当前片段尚未达到规划时长。",
-            "continuation_prompt": segment["prompt"],
-            "retry_prompt": segment["prompt"],
-        }
+        review = AdSegmentReview.model_validate(raw_review)
+    except (RuntimeError, ValidationError) as error:
+        raise RuntimeError(f"Advertising segment review was unavailable or invalid: {error}") from error
+    return review.model_dump()
 
 
 async def plan_ad_segment_transition(
@@ -2583,30 +3072,27 @@ async def plan_ad_segment_transition(
         ensure_ascii=False,
     )
     try:
-        decision = await request_ad_llm(
+        raw_decision = await request_ad_llm(
             system_prompt=load_ad_prompt("segment_transition_v1.md"),
             user_prompt=user_prompt,
-            image_paths=previous_frames[-2:],
+            image_paths=previous_frames[-3:],
         )
+        decision = AdTransitionDecision.model_validate(raw_decision)
         return {
-            "should_continue": bool(decision.get("should_continue")),
-            "transition_type": str(decision.get("transition_type", "hard_cut"))[:80],
-            "reason": str(decision.get("reason", ""))[:500],
-            "preserve": [
-                str(item)[:200] for item in decision.get("preserve", [])
-            ][:8],
-            "transition_prompt": str(
-                decision.get("transition_prompt") or next_segment.get("prompt", "")
-            )[:3000],
+            "should_continue": decision.should_continue,
+            "transition_type": decision.transition_type,
+            "reason": decision.reason,
+            "preserve": decision.preserve,
+            "transition_prompt": decision.transition_prompt,
         }
-    except RuntimeError as error:
+    except (RuntimeError, ValidationError) as error:
         same_asset = (
             previous_segment.get("asset_index", -1) >= 0
             and previous_segment.get("asset_index") == next_segment.get("asset_index")
         )
         return {
-            "should_continue": same_asset,
-            "transition_type": "direct_continuation" if same_asset else "hard_cut",
+            "should_continue": False,
+            "transition_type": "match_cut" if same_asset else "hard_cut",
             "reason": f"Transition fallback: {error}",
             "preserve": ["主体身份", "画幅", "光线方向"],
             "transition_prompt": next_segment.get("prompt", ""),
@@ -2622,9 +3108,28 @@ async def ensure_ad_master(project_id: str, source_paths: list[Path]) -> str:
     project_dir = AD_WORK_DIR / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
     width, height, fps = ad_output_settings(project)
+    transitions = ad_transition_specs(project, source_paths)
+    segment_records = ad_segment_records_for_source_paths(project, source_paths)
     normalized: list[Path] = []
     for index, source in enumerate(source_paths, start=1):
         target = project_dir / f"normalized-{index:02d}.mp4"
+        record = segment_records[index - 1]
+        target_duration = (
+            float(record["target_duration_seconds"]) if record is not None else None
+        )
+        transition_tail = (
+            ad_transition_overlap(
+                str(transitions[index - 1].get("type", "hard_cut")),
+                target_duration or probe_video_duration(source),
+                float(segment_records[index]["target_duration_seconds"])
+                if index < len(segment_records) and segment_records[index] is not None
+                else probe_video_duration(source_paths[index])
+                if index < len(source_paths)
+                else 0.1,
+            )
+            if index < len(source_paths)
+            else 0.0
+        )
         await asyncio.to_thread(
             normalize_ad_clip,
             source,
@@ -2632,10 +3137,18 @@ async def ensure_ad_master(project_id: str, source_paths: list[Path]) -> str:
             width=width,
             height=height,
             fps=fps,
+            duration_seconds=target_duration,
+            transition_tail_seconds=transition_tail,
         )
         normalized.append(target)
     joined = project_dir / "joined.mp4"
-    await asyncio.to_thread(concat_ad_clips, normalized, joined, project_dir)
+    await asyncio.to_thread(
+        concat_ad_clips,
+        normalized,
+        joined,
+        project_dir,
+        transitions,
+    )
     master_relative = Path("ad") / project_id / "master.mp4"
     master_path = MEDIA_DIR / master_relative
     master_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2654,16 +3167,54 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
     master_path = MEDIA_DIR / master_relative
     project_dir = AD_WORK_DIR / project_id
     duration = await asyncio.to_thread(probe_video_duration, master_path)
-    voice_path: Path | None = None
-    if project["voice_enabled"] and plan.get("voiceover_script"):
-        voice_path = project_dir / "voice.mp3"
-        await edge_tts.Communicate(
-            plan["voiceover_script"], voice=project["voice_id"]
-        ).save(str(voice_path))
+    transitions = ad_transition_specs(project, source_paths)
+    segment_records = ad_segment_records_for_source_paths(project, source_paths)
+    target_durations = [
+        float(record["target_duration_seconds"])
+        if record is not None
+        else await asyncio.to_thread(probe_video_duration, source)
+        for record, source in zip(segment_records, source_paths)
+    ]
+    segment_durations = await asyncio.to_thread(
+        ad_timeline_segment_durations,
+        source_paths,
+        transitions,
+        target_durations,
+    )
+    plan_segments = list(plan.get("segments", []))
+    beats = [
+        str(segment.get("voiceover_beat", "")).strip()
+        for segment in plan_segments[:len(segment_durations)]
+    ]
+    if len(beats) != len(segment_durations) or not any(beats):
+        beats = voiceover_beats_for_segments(
+            str(plan.get("voiceover_script", "")),
+            [
+                {"duration_seconds": value}
+                for value in segment_durations
+            ],
+        )
+    voice_path = (
+        await render_ad_voiceover_track(
+            project_dir,
+            beats=beats,
+            segment_durations=segment_durations,
+            voice_id=project["voice_id"],
+        )
+        if project["voice_enabled"]
+        else None
+    )
     subtitle_path: Path | None = None
-    if project["subtitle_enabled"] and plan.get("voiceover_script"):
+    if project["subtitle_enabled"] and any(item.strip() for item in beats):
         subtitle_path = project_dir / "subtitles.ass"
-        write_ad_subtitles(plan["voiceover_script"], duration, subtitle_path)
+        width, height, _ = ad_output_settings(project)
+        write_ad_subtitles(
+            beats,
+            segment_durations,
+            subtitle_path,
+            width=width,
+            height=height,
+        )
 
     with database() as connection:
         next_version = int(
@@ -2681,10 +3232,8 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
     input_index = 1
     if voice_path:
         command.extend(["-i", str(voice_path)])
-        voice_duration = await asyncio.to_thread(probe_video_duration, voice_path)
-        tempo = min(2.0, max(0.5, voice_duration / max(duration, 0.1)))
         filters.append(
-            f"[{input_index}:a]atempo={tempo:.4f},apad,atrim=0:{duration:.3f},"
+            f"[{input_index}:a]apad,atrim=0:{duration:.3f},"
             f"afade=t=in:st=0:d=0.08,afade=t=out:st={max(duration - 0.12, 0):.3f}:d=0.12[voice]"
         )
         audio_label = "voice"
@@ -2726,8 +3275,8 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
     else:
         command.append("-an")
     command.extend([
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        "-r", "24", str(final_path),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(final_path),
     ])
     result = await asyncio.to_thread(
         subprocess.run,
@@ -2876,11 +3425,12 @@ async def run_ad_project(project_id: str) -> None:
             provider = get_provider(provider_id, required_capability)
             target_seconds = float(definition["duration_seconds"])
             segment_id = uuid.uuid4().hex
-            prompt = (
+            shot_prompt = (
                 str(incoming_transition.get("transition_prompt") or definition["prompt"])
                 if incoming_transition
                 else definition["prompt"]
             )
+            prompt = ad_generation_prompt(plan, shot_prompt)
             with database() as connection:
                 retry_count = int(
                     connection.execute(
@@ -2911,7 +3461,7 @@ async def run_ad_project(project_id: str) -> None:
             width, height = local_video_dimensions(
                 provider, project.get("video_resolution")
             )
-            length = ad_video_frame_count(target_seconds, fps)
+            length = ad_video_frame_count(target_seconds, fps, provider)
             config = {
                 "width": width,
                 "height": height,
@@ -2952,6 +3502,22 @@ async def run_ad_project(project_id: str) -> None:
             frames = await asyncio.to_thread(extract_ad_keyframes, output_path, frame_dir)
             await set_ad_project_state(project_id, "reviewing_segments")
             continuation_count = 0
+            _, _, native_clip_seconds = ad_segment_duration_bounds(provider, fps)
+            continuation_overlap_seconds = 8 / max(fps, 1)
+            maximum_continuations = max(
+                3,
+                int(
+                    max(
+                        0,
+                        (
+                            target_seconds
+                            / max(native_clip_seconds - continuation_overlap_seconds, 0.5)
+                        )
+                        - 1,
+                    )
+                )
+                + 1,
+            )
             review = await review_ad_segment(
                 project,
                 plan,
@@ -2966,14 +3532,15 @@ async def run_ad_project(project_id: str) -> None:
                         "UPDATE ad_segments SET status = 'rejected', review_json = ? WHERE id = ?",
                         (json.dumps(review, ensure_ascii=False), segment_id),
                     )
-                retry_prompt = str(review.get("retry_prompt") or prompt).strip()
+                retry_prompt = str(review.get("retry_prompt") or shot_prompt).strip()
                 if len(retry_prompt) < 5:
                     raise RuntimeError(
                         f"Segment {sequence} was rejected but no usable retry prompt was returned"
                     )
                 retry_count += 1
                 segment_id = uuid.uuid4().hex
-                prompt = retry_prompt[:3000]
+                shot_prompt = retry_prompt[:3000]
+                prompt = ad_generation_prompt(plan, shot_prompt)
                 with database() as connection:
                     connection.execute(
                         """
@@ -3032,14 +3599,16 @@ async def run_ad_project(project_id: str) -> None:
                         f"Segment {sequence} was rejected again after an automatic quality retry"
                     )
             while (
-                bool(review.get("should_continue"))
-                and current_duration + 0.25 < target_seconds
-                and continuation_count < 3
+                current_duration + 0.25 < target_seconds
+                and continuation_count < maximum_continuations
                 and provider_supports_continuation(provider)
             ):
                 continuation = make_generation(
                     mode="continue",
-                    prompt=str(review.get("continuation_prompt") or prompt),
+                    prompt=ad_generation_prompt(
+                        plan,
+                        str(review.get("continuation_prompt") or shot_prompt),
+                    ),
                     negative_prompt=AD_NEGATIVE_PROMPT,
                     parent_generation_id=generated["id"],
                     config={
@@ -3052,6 +3621,7 @@ async def run_ad_project(project_id: str) -> None:
                                 + 8 / config["fps"],
                             ),
                             config["fps"],
+                            provider,
                         ),
                         "tail_frames": 8,
                         "join_parent": True,
@@ -3082,16 +3652,15 @@ async def run_ad_project(project_id: str) -> None:
                     current_duration_seconds=current_duration,
                     continuation_count=continuation_count,
                 )
-            if (
-                bool(review.get("should_continue"))
-                and current_duration + 0.25 < target_seconds
-                and not provider_supports_continuation(provider)
-            ):
-                review["continue_reason"] = (
-                    f"{review.get('continue_reason', '')} "
-                    f"Selected provider {provider.label} does not support video continuation."
-                ).strip()
-                review["should_continue"] = False
+            if current_duration + 0.25 < target_seconds:
+                raise RuntimeError(
+                    f"Segment {sequence} reached {current_duration:.2f}s but needs "
+                    f"{target_seconds:.2f}s; continuation could not complete it."
+                )
+            review["should_continue"] = False
+            review["continue_reason"] = (
+                "The planned segment duration has been reached."
+            )
             with database() as connection:
                 if incoming_transition:
                     review["incoming_transition"] = incoming_transition
@@ -3145,8 +3714,7 @@ async def run_ad_recompose(project_id: str) -> None:
             raise RuntimeError("Approved advertising plan was not found")
         source_paths = [
             MEDIA_DIR / item["output_path"]
-            for item in project["segments"]
-            if item["status"] == "succeeded" and item.get("output_path")
+            for item in completed_ad_segments_for_plan(project, plan_record)
         ]
         if not source_paths:
             raise RuntimeError("Completed video segments were not found")
@@ -3600,7 +4168,14 @@ async def create_ad_plan_version(
     asset_image_paths = ad_asset_image_paths(project)
     reference_video_frames = await ad_reference_video_frame_paths(project)
     target_duration = int(project["target_duration_seconds"])
-    recommended_segment_count = ad_segment_count(target_duration)
+    provider = get_provider(project.get("video_provider_id", DEFAULT_PROVIDER_ID))
+    fps = provider_fps(provider, int(project.get("video_fps") or 8))
+    minimum_segment_seconds, maximum_segment_seconds, native_clip_seconds = (
+        ad_segment_duration_bounds(provider, fps)
+    )
+    recommended_segment_count = ad_segment_count(
+        target_duration, minimum_seconds=minimum_segment_seconds
+    )
     instruction = {
         "brief": project["brief"],
         "target_duration_seconds": target_duration,
@@ -3637,14 +4212,20 @@ async def create_ad_plan_version(
         "user_feedback": feedback,
         "segment_count_guidance": {
             "recommended_count": recommended_segment_count,
-            "recommended_segment_seconds": "2 to 10 seconds, varied by narrative beat",
+            "recommended_segment_seconds": (
+                f"{minimum_segment_seconds} to {maximum_segment_seconds} seconds, "
+                "varied by narrative beat"
+            ),
+            "native_generation_clip_seconds": round(native_clip_seconds, 2),
         },
         "constraints": [
             "Do not use a video model. This is planning only.",
             (
                 f"Use approximately {recommended_segment_count} short shots. "
                 "Vary shot durations according to the advertising narrative rather than "
-                "splitting them evenly. The segment durations must add up exactly to the requested duration."
+                f"splitting them evenly. Every shot must be between {minimum_segment_seconds} "
+                f"and {maximum_segment_seconds} seconds. The segment durations must add up "
+                "exactly to the requested duration."
             ),
             (
                 "asset_index is the single reference image selected for that shot. You "
@@ -3689,6 +4270,8 @@ async def create_ad_plan_version(
             rebalance_ad_durations(
                 [int(segment["duration_seconds"]) for segment in suffix],
                 remaining_duration,
+                minimum_seconds=minimum_segment_seconds,
+                maximum_seconds=maximum_segment_seconds,
             ),
         ):
             segment["duration_seconds"] = seconds
@@ -3851,6 +4434,7 @@ async def rewrite_ad_segment_prompt(
                     "overall_plan": {
                         "title": plan.get("title", ""),
                         "strategy": plan.get("strategy", ""),
+                        "visual_bible": plan.get("visual_bible", {}),
                     },
                     "segment_index": request.segment_index + 1,
                     "segment": {
@@ -3923,6 +4507,7 @@ async def rewrite_ad_plan_prompts(
                     "overall_plan": {
                         "title": plan.get("title", ""),
                         "strategy": plan.get("strategy", ""),
+                        "visual_bible": plan.get("visual_bible", {}),
                     },
                     "segments": [
                         {
@@ -4147,6 +4732,12 @@ async def edit_ad_final(
     plan = dict(plan_record["plan"])
     if request.voiceover_script is not None:
         plan["voiceover_script"] = request.voiceover_script.strip()
+        segments = list(plan.get("segments", []))
+        for segment, beat in zip(
+            segments, voiceover_beats_for_segments(plan["voiceover_script"], segments)
+        ):
+            segment["voiceover_beat"] = beat
+        plan["segments"] = segments
     if request.post_caption is not None:
         plan["post_caption"] = request.post_caption.strip()
     if request.hashtags is not None:

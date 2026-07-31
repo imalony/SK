@@ -19,10 +19,17 @@
     plan: {
       title: string
       strategy: string
+      visual_bible?: {
+        product_identity?: string[]
+        art_direction?: string
+        lighting_and_palette?: string
+        continuity_rules?: string[]
+        negative_constraints?: string[]
+      }
       voiceover_script: string
       post_caption: string
       hashtags: string[]
-      segments: Array<{ asset_index: number; duration_seconds: number; purpose: string; motion: string; prompt: string }>
+      segments: Array<{ asset_index: number; duration_seconds: number; purpose: string; motion: string; prompt: string; voiceover_beat?: string }>
       warning?: string
     }
   }
@@ -849,8 +856,20 @@
         <button class="text-command" on:click={reset}>重新开始</button>
       </div>
       <section class="plan-layout">
-        <div class="plan-content">
-          <div class="strategy"><span>创意方向</span><p>{latestPlan.plan.strategy}</p></div>
+          <div class="plan-content">
+            <div class="strategy"><span>创意方向</span><p>{latestPlan.plan.strategy}</p></div>
+            {#if latestPlan.plan.visual_bible}
+              <section class="reference-analysis">
+                <span>全片视觉圣经</span>
+                <p>{latestPlan.plan.visual_bible.art_direction}</p>
+                <div class="reference-notes">
+                  <p><strong>主体锚点：</strong>{latestPlan.plan.visual_bible.product_identity?.join('；')}</p>
+                  <p><strong>光色：</strong>{latestPlan.plan.visual_bible.lighting_and_palette}</p>
+                  <p><strong>连续性：</strong>{latestPlan.plan.visual_bible.continuity_rules?.join('；')}</p>
+                  <p><strong>禁止变化：</strong>{latestPlan.plan.visual_bible.negative_constraints?.join('；')}</p>
+                </div>
+              </section>
+            {/if}
           {#if project.reference_analysis}
             <section class="reference-analysis">
               <span>参考视频拆解</span>
@@ -875,6 +894,9 @@
                     <span>视频模型提示词</span>
                     <textarea bind:value={segment.prompt} maxlength="3000"></textarea>
                   </label>
+                  {#if voiceEnabled && segment.voiceover_beat}
+                    <p class="shot-voiceover"><strong>该镜配音：</strong>{segment.voiceover_beat}</p>
+                  {/if}
                   <div class="shot-ai-rewrite">
                     <input bind:value={shotRewriteInstructions[index]} maxlength="1000" placeholder="AI 改写要求（可选）" />
                     <button class="secondary-command" disabled={loading || savingShotPrompts || rewritingAllShotPrompts || rewritingShotIndex !== null} on:click={() => rewriteShotPrompt(index, segment.prompt)}>
