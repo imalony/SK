@@ -81,6 +81,7 @@ event_clients: set[WebSocket] = set()
 generation_tasks: dict[str, asyncio.Task[None]] = {}
 edit_parser_tasks: set[asyncio.Task[Any]] = set()
 ad_project_tasks: dict[str, asyncio.Task[None]] = {}
+ad_segment_review_tasks: dict[str, set[asyncio.Task[None]]] = {}
 model_activity = "idle"
 logger = logging.getLogger(__name__)
 
@@ -1373,10 +1374,15 @@ def ad_project_detail(project_id: str) -> dict[str, Any]:
         }
         for row in plans
     ]
-    result["segments"] = [
-        {**dict(row), "review": json.loads(row["review_json"]) if row["review_json"] else None}
-        for row in segments
-    ]
+    result["segments"] = []
+    for row in segments:
+        segment = {
+            **dict(row),
+            "review": json.loads(row["review_json"]) if row["review_json"] else None,
+        }
+        if segment.get("output_path"):
+            segment["output_url"] = f"/media/{segment['output_path']}"
+        result["segments"].append(segment)
     generation_ids = [
         segment["generation_id"]
         for segment in result["segments"]
@@ -3163,6 +3169,75 @@ async def review_ad_segment(
     return review.model_dump()
 
 
+async def persist_ad_segment_review(
+    *,
+    project: dict[str, Any],
+    plan: dict[str, Any],
+    segment: dict[str, Any],
+    frames: list[Path],
+    current_duration_seconds: float,
+    continuation_count: int,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        review = await review_ad_segment(
+            project,
+            plan,
+            segment,
+            frames,
+            current_duration_seconds=current_duration_seconds,
+            continuation_count=continuation_count,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        review = {
+            "available": False,
+            "error": str(error)[:1000],
+            "non_blocking": True,
+        }
+    if metadata:
+        review.update(metadata)
+    with database() as connection:
+        connection.execute(
+            "UPDATE ad_segments SET review_json = ? WHERE id = ?",
+            (json.dumps(review, ensure_ascii=False), segment["id"]),
+        )
+    await broadcast_ad_project(project["id"])
+
+
+def start_ad_segment_review_task(
+    *,
+    project: dict[str, Any],
+    plan: dict[str, Any],
+    segment: dict[str, Any],
+    frames: list[Path],
+    current_duration_seconds: float,
+    continuation_count: int,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    task = asyncio.create_task(
+        persist_ad_segment_review(
+            project=project,
+            plan=plan,
+            segment=segment,
+            frames=frames,
+            current_duration_seconds=current_duration_seconds,
+            continuation_count=continuation_count,
+            metadata=metadata,
+        )
+    )
+    tasks = ad_segment_review_tasks.setdefault(project["id"], set())
+    tasks.add(task)
+
+    def discard(completed: asyncio.Task[None]) -> None:
+        tasks.discard(completed)
+        if not tasks:
+            ad_segment_review_tasks.pop(project["id"], None)
+
+    task.add_done_callback(discard)
+
+
 async def plan_ad_segment_transition(
     project: dict[str, Any],
     plan: dict[str, Any],
@@ -3631,7 +3706,16 @@ async def run_ad_project(project_id: str) -> None:
             current_duration = await asyncio.to_thread(probe_video_duration, output_path)
             frame_dir = AD_WORK_DIR / project_id / f"segment-{sequence:02d}"
             frames = await asyncio.to_thread(extract_ad_keyframes, output_path, frame_dir)
-            await set_ad_project_state(project_id, "reviewing_segments")
+            with database() as connection:
+                connection.execute(
+                    """
+                    UPDATE ad_segments
+                    SET status = 'generated', output_path = ?
+                    WHERE id = ?
+                    """,
+                    (generated["output_path"], segment_id),
+                )
+            await broadcast_ad_project(project_id)
             continuation_count = 0
             _, _, native_clip_seconds = ad_segment_duration_bounds(provider, fps)
             continuation_tail_frames = provider_continuation_tail_frames(provider)
@@ -3650,86 +3734,6 @@ async def run_ad_project(project_id: str) -> None:
                 )
                 + 1,
             )
-            review = await review_ad_segment(
-                project,
-                plan,
-                definition,
-                frames,
-                current_duration_seconds=current_duration,
-                continuation_count=continuation_count,
-            )
-            if review.get("approved") is False:
-                with database() as connection:
-                    connection.execute(
-                        "UPDATE ad_segments SET status = 'rejected', review_json = ? WHERE id = ?",
-                        (json.dumps(review, ensure_ascii=False), segment_id),
-                    )
-                retry_prompt = str(review.get("retry_prompt") or shot_prompt).strip()
-                if len(retry_prompt) < 5:
-                    raise RuntimeError(
-                        f"Segment {sequence} was rejected but no usable retry prompt was returned"
-                    )
-                retry_count += 1
-                segment_id = uuid.uuid4().hex
-                shot_prompt = retry_prompt[:3000]
-                prompt = ad_generation_prompt(plan, shot_prompt)
-                with database() as connection:
-                    connection.execute(
-                        """
-                        INSERT INTO ad_segments (
-                          id, project_id, plan_id, sequence_number, asset_id,
-                          parent_segment_id, target_duration_seconds, prompt,
-                          retry_count, status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')
-                        """,
-                        (
-                            segment_id,
-                            project_id,
-                            plan_record["id"],
-                            sequence,
-                            segment_asset_id,
-                            previous_segment_id if should_continue_from_previous else None,
-                            target_seconds,
-                            prompt,
-                            retry_count,
-                        ),
-                    )
-                generation = make_generation(
-                    mode=generation_mode,
-                    prompt=prompt,
-                    negative_prompt=AD_NEGATIVE_PROMPT,
-                    reference_asset_id=reference_asset_id if not should_continue_from_previous else None,
-                    parent_generation_id=generation_parent_id,
-                    config={**config, "seed": int.from_bytes(os.urandom(8), "big")},
-                )
-                with database() as connection:
-                    connection.execute(
-                        "UPDATE ad_segments SET generation_id = ? WHERE id = ?",
-                        (generation["id"], segment_id),
-                    )
-                await broadcast_ad_project(project_id)
-                start_generation_task(generation["id"])
-                generated = await wait_for_generation(generation["id"])
-                output_path = MEDIA_DIR / generated["output_path"]
-                current_duration = await asyncio.to_thread(probe_video_duration, output_path)
-                frames = await asyncio.to_thread(extract_ad_keyframes, output_path, frame_dir / "retry-1")
-                review = await review_ad_segment(
-                    project,
-                    plan,
-                    definition,
-                    frames,
-                    current_duration_seconds=current_duration,
-                    continuation_count=continuation_count,
-                )
-                if review.get("approved") is False:
-                    with database() as connection:
-                        connection.execute(
-                            "UPDATE ad_segments SET status = 'rejected', review_json = ? WHERE id = ?",
-                            (json.dumps(review, ensure_ascii=False), segment_id),
-                        )
-                    raise RuntimeError(
-                        f"Segment {sequence} was rejected again after an automatic quality retry"
-                    )
             while (
                 current_duration + 0.25 < target_seconds
                 and continuation_count < maximum_continuations
@@ -3737,10 +3741,7 @@ async def run_ad_project(project_id: str) -> None:
             ):
                 continuation = make_generation(
                     mode="continue",
-                    prompt=ad_generation_prompt(
-                        plan,
-                        str(review.get("continuation_prompt") or shot_prompt),
-                    ),
+                    prompt=ad_generation_prompt(plan, shot_prompt),
                     negative_prompt=AD_NEGATIVE_PROMPT,
                     parent_generation_id=generated["id"],
                     config={
@@ -3767,8 +3768,12 @@ async def run_ad_project(project_id: str) -> None:
                 continuation_count += 1
                 with database() as connection:
                     connection.execute(
-                        "UPDATE ad_segments SET generation_id = ? WHERE id = ?",
-                        (generated["id"], segment_id),
+                        """
+                        UPDATE ad_segments
+                        SET generation_id = ?, status = 'generated', output_path = ?
+                        WHERE id = ?
+                        """,
+                        (generated["id"], generated["output_path"], segment_id),
                     )
                 await broadcast_ad_project(project_id)
                 frames = await asyncio.to_thread(
@@ -3776,30 +3781,38 @@ async def run_ad_project(project_id: str) -> None:
                     output_path,
                     frame_dir / f"continuation-{continuation_count}",
                 )
-                review = await review_ad_segment(
-                    project,
-                    plan,
-                    definition,
-                    frames,
-                    current_duration_seconds=current_duration,
-                    continuation_count=continuation_count,
-                )
             if current_duration + 0.25 < target_seconds:
                 raise RuntimeError(
                     f"Segment {sequence} reached {current_duration:.2f}s but needs "
                     f"{target_seconds:.2f}s; continuation could not complete it."
                 )
-            review["should_continue"] = False
-            review["continue_reason"] = (
-                "The planned segment duration has been reached."
-            )
             with database() as connection:
-                if incoming_transition:
-                    review["incoming_transition"] = incoming_transition
                 connection.execute(
-                    "UPDATE ad_segments SET status = 'succeeded', output_path = ?, review_json = ? WHERE id = ?",
-                    (generated["output_path"], json.dumps(review, ensure_ascii=False), segment_id),
+                    """
+                    UPDATE ad_segments
+                    SET status = 'succeeded', output_path = ?
+                    WHERE id = ?
+                    """,
+                    (generated["output_path"], segment_id),
                 )
+            start_ad_segment_review_task(
+                project=project,
+                plan=plan,
+                segment={
+                    **definition,
+                    "id": segment_id,
+                    "sequence_number": sequence,
+                },
+                frames=frames,
+                current_duration_seconds=current_duration,
+                continuation_count=continuation_count,
+                metadata=(
+                    {"incoming_transition": incoming_transition}
+                    if incoming_transition
+                    else None
+                ),
+            )
+            await broadcast_ad_project(project_id)
             source_paths.append(output_path)
             previous_generation_id = generated["id"]
             previous_segment_id = segment_id
@@ -4145,6 +4158,11 @@ async def stop_all_operations() -> dict[str, Any]:
             *generation_tasks.values(),
             *edit_parser_tasks,
             *ad_project_tasks.values(),
+            *(
+                task
+                for tasks in ad_segment_review_tasks.values()
+                for task in tasks
+            ),
         ]
         for task in cancellable_tasks:
             if not task.done():
@@ -4289,11 +4307,21 @@ async def delete_ad_project(project_id: str) -> dict[str, Any]:
         "composing_audio_video",
     }
     active_task = ad_project_tasks.get(project_id)
-    if project["status"] in active_statuses or (active_task and not active_task.done()):
+    if (
+        project["status"] in active_statuses
+        or (active_task and not active_task.done())
+    ):
         raise HTTPException(
             status_code=409,
             detail="Stop the active advertising task before deleting it.",
         )
+
+    review_tasks = list(ad_segment_review_tasks.get(project_id, set()))
+    for review_task in review_tasks:
+        if not review_task.done():
+            review_task.cancel()
+    if review_tasks:
+        await asyncio.gather(*review_tasks, return_exceptions=True)
 
     with database() as connection:
         asset_rows = connection.execute(
@@ -5120,6 +5148,12 @@ async def stop_ad_project(project_id: str) -> dict[str, Any]:
     if task and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    review_tasks = list(ad_segment_review_tasks.get(project_id, set()))
+    for review_task in review_tasks:
+        if not review_task.done():
+            review_task.cancel()
+    if review_tasks:
+        await asyncio.gather(*review_tasks, return_exceptions=True)
     with database() as connection:
         generation_rows = connection.execute(
             """
@@ -5153,6 +5187,12 @@ async def return_ad_project_to_plan(project_id: str) -> dict[str, Any]:
     if task and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    review_tasks = list(ad_segment_review_tasks.get(project_id, set()))
+    for review_task in review_tasks:
+        if not review_task.done():
+            review_task.cancel()
+    if review_tasks:
+        await asyncio.gather(*review_tasks, return_exceptions=True)
     with database() as connection:
         rows = connection.execute(
             "SELECT generation_id FROM ad_segments WHERE project_id = ? AND generation_id IS NOT NULL",

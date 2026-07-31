@@ -222,6 +222,7 @@
   $: activeSegment = project?.segments.find((segment) => segment.generation && !['succeeded', 'failed'].includes(segment.generation.status))
   $: activeRun = project?.runs.find((run) => run.status === 'running')
   $: progressPercent = Math.round(((activeSegment?.generation?.progress ?? activeRun?.progress ?? 0) * 100))
+  $: availableSegmentOutputs = project?.segments.filter((segment) => Boolean(segment.output_url)) ?? []
   $: if (latestPlan && latestPlan.id !== editorPlanId) {
     editorPlanId = latestPlan.id
     finalVoiceover = latestPlan.plan.voiceover_script
@@ -1111,6 +1112,20 @@
         <h1>{project.status === 'interrupted' ? '可从已完成的步骤继续' : project.status === 'failed' ? '广告视频未能生成完成' : '广告视频制作已停止'}</h1>
         <p class="run-error">{project.error_message || '任务已停止，未继续执行。'}</p>
         <p>不会继续调用视频模型或消耗本地资源。</p>
+        {#if availableSegmentOutputs.length}
+          <div class="segment-output-list">
+            <strong>已生成的分镜</strong>
+            {#each availableSegmentOutputs as segment}
+              <article>
+                <video controls playsinline src={`${apiBase}${segment.output_url}`}><track kind="captions" srclang="zh" label="中文字幕" /></video>
+                <div>
+                  <span>镜头 {String(segment.sequence_number).padStart(2, '0')} · {segment.status}</span>
+                  <a href={`${apiBase}${segment.output_url}`} download><Download size={15} /> 下载此镜头</a>
+                </div>
+              </article>
+            {/each}
+          </div>
+        {/if}
         {#if project.plans.length}
           <button class="secondary-command return-plan-command" disabled={loading} on:click={returnToPlan}>返回已确认文案</button>
         {/if}
@@ -1130,9 +1145,24 @@
         </div>
         <div class="progress-list">
           {#each project.segments as segment}
-            <div class:done={segment.status === 'succeeded'}><span>{String(segment.sequence_number).padStart(2, '0')}</span><strong>{segment.status === 'succeeded' ? '分镜已完成' : segment.generation?.status === 'running' ? '模型生成中' : '等待处理'}</strong><small>{segment.generation ? `${Math.round(segment.generation.progress * 100)}%` : `${Math.round(segment.target_duration_seconds)} 秒`}</small></div>
+            <div class:done={segment.status === 'succeeded'}><span>{String(segment.sequence_number).padStart(2, '0')}</span><strong>{segment.status === 'succeeded' ? '分镜已完成' : segment.status === 'generated' ? '已生成，可预览' : segment.generation?.status === 'running' ? '模型生成中' : '等待处理'}</strong><small>{segment.generation ? `${Math.round(segment.generation.progress * 100)}%` : `${Math.round(segment.target_duration_seconds)} 秒`}</small></div>
           {/each}
         </div>
+        {#if availableSegmentOutputs.length}
+          <div class="segment-output-list">
+            <strong>实时分镜产物</strong>
+            {#each availableSegmentOutputs as segment}
+              <article>
+                <video controls playsinline src={`${apiBase}${segment.output_url}`}><track kind="captions" srclang="zh" label="中文字幕" /></video>
+                <div>
+                  <span>镜头 {String(segment.sequence_number).padStart(2, '0')} · {segment.status === 'generated' ? '已生成，可能仍在接续' : '已完成'}</span>
+                  {#if segment.review?.approved === false}<small>审片提示：该镜头存在质量风险，但不影响后续流程。</small>{/if}
+                  <a href={`${apiBase}${segment.output_url}`} download><Download size={15} /> 下载此镜头</a>
+                </div>
+              </article>
+            {/each}
+          </div>
+        {/if}
         <button class="secondary-command return-plan-command" disabled={loading} on:click={returnToPlan}>返回已确认文案</button>
         <button class="stop-command" disabled={loading} on:click={stopProject}><Square size={16} /> 停止并释放资源</button>
       </section>
@@ -1346,6 +1376,14 @@
   .replan-from-segment { display: grid; gap: 9px; margin-top: 14px; padding-top: 14px; border-top: 1px solid #d8e1dc; } .replan-from-segment label { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #4b6158; font-size: 12px; font-weight: 750; } .replan-from-segment input { width: 68px; height: 34px; padding: 0 8px; border: 1px solid #cbd7d0; border-radius: 5px; background: #fff; } .replan-from-segment textarea { min-height: 82px; }
   .secondary-command { width: 100%; margin-top: 10px; border: 1px solid #a6b9b0; color: #365248; background: #fff; } .approve-command { width: 100%; margin-top: 12px; border: 0; color: #fff; background: #176b5c; } .confirm-panel small { display: block; margin-top: 12px; color: #7a8d84; font-size: 12px; line-height: 1.5; }
   .run-screen { max-width: 620px; margin: 72px auto; text-align: center; } .run-spinner { color: #23816e; margin-bottom: 15px; } .generation-progress { margin: 24px 0 0; text-align: left; } .generation-progress > div { display: flex; justify-content: space-between; color: #52685e; font-size: 13px; font-weight: 750; } .generation-progress i { display: block; height: 7px; margin-top: 8px; overflow: hidden; border-radius: 4px; background: #dce8e1; } .generation-progress b { display: block; height: 100%; min-width: 3px; border-radius: inherit; background: #23816e; transition: width .3s ease; } .generation-progress small { display: block; margin-top: 7px; color: #7a8d84; font-size: 12px; } .progress-list { margin: 30px 0; border-top: 1px solid #d8e1dc; text-align: left; } .progress-list > div { display: grid; grid-template-columns: 35px 1fr auto; padding: 13px 2px; border-bottom: 1px solid #d8e1dc; color: #63756d; } .progress-list .done { color: #25836f; } .progress-list span { font-size: 12px; font-weight: 800; } .progress-list strong { font-size: 13px; } .progress-list small { font-size: 12px; }
+  .segment-output-list { display: grid; gap: 11px; margin: 24px 0; padding: 16px 0; border-top: 1px solid #d8e1dc; border-bottom: 1px solid #d8e1dc; text-align: left; }
+  .segment-output-list > strong { color: #36564b; font-size: 13px; }
+  .segment-output-list article { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 12px; align-items: center; }
+  .segment-output-list video { width: 92px; aspect-ratio: 9 / 16; max-height: 140px; border-radius: 5px; background: #17211d; }
+  .segment-output-list article div { display: grid; gap: 6px; min-width: 0; }
+  .segment-output-list span { color: #425b51; font-size: 13px; font-weight: 750; }
+  .segment-output-list small { margin: 0; color: #96612c; line-height: 1.45; }
+  .segment-output-list a { display: inline-flex; align-items: center; gap: 5px; width: fit-content; color: #176b5c; font-size: 12px; font-weight: 750; text-decoration: none; }
   .return-plan-command { width: auto; min-width: 154px; margin: 0 10px 0 0; padding: 0 14px; } .stop-command { padding: 0 16px; border: 1px solid #d7a69d; color: #a54236; background: #fff; } .run-error, .error-message { color: #aa3e32; } .error-message { margin-top: 22px; padding: 10px 12px; border: 1px solid #edc7c0; background: #fff4f1; border-radius: 5px; font-size: 13px; }
   .terminal-screen .run-error { max-width: 620px; margin: 20px auto 8px; padding: 12px; border: 1px solid #edc7c0; border-radius: 5px; background: #fff4f1; line-height: 1.6; } .terminal-screen > p:not(.eyebrow):not(.run-error) { color: #61746c; } .retry-command { width: auto; min-width: 154px; margin-top: 12px; padding: 0 16px; }
   .result-layout video { width: min(100%, 480px); max-height: 720px; background: #111; border-radius: 6px; } .result-copy { padding-top: 10px; } .download-command { width: 100%; margin-bottom: 26px; color: #fff; background: #176b5c; } .result-copy p { color: #52665d; line-height: 1.65; }
