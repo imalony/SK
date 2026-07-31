@@ -3017,64 +3017,40 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 async def render_ad_voiceover_track(
     project_dir: Path,
     *,
-    beats: list[str],
-    segment_durations: list[float],
+    script: str,
+    target_duration_seconds: float,
     voice_id: str,
 ) -> Path | None:
-    if not any(item.strip() for item in beats):
+    clean_script = script.strip()
+    if not clean_script:
         return None
-    raw_paths: list[Path | None] = []
-    for index, beat in enumerate(beats, start=1):
-        if not beat.strip():
-            raw_paths.append(None)
-            continue
-        source = project_dir / f"voice-beat-{index:02d}.mp3"
-        await edge_tts.Communicate(beat, voice=voice_id).save(str(source))
-        raw_paths.append(source)
 
-    command = [ffmpeg_executable(), "-y"]
-    input_indexes: list[int | None] = []
-    for source in raw_paths:
-        if source is None:
-            input_indexes.append(None)
-            continue
-        input_indexes.append(len([item for item in input_indexes if item is not None]))
-        command.extend(["-i", str(source)])
-    filters: list[str] = []
-    labels: list[str] = []
-    for index, (source, input_index, duration) in enumerate(
-        zip(raw_paths, input_indexes, segment_durations)
-    ):
-        label = f"voice{index}"
-        labels.append(label)
-        if source is None or input_index is None:
-            filters.append(
-                f"anullsrc=r=48000:cl=stereo,atrim=0:{max(0.05, duration):.3f}[{label}]"
-            )
-            continue
-        source_duration = await asyncio.to_thread(probe_video_duration, source)
-        tempo = min(1.45, max(0.72, source_duration / max(duration, 0.1)))
-        fade_out_start = max(duration - 0.08, 0)
-        filters.append(
-            f"[{input_index}:a]atempo={tempo:.4f},apad,atrim=0:{duration:.3f},"
-            f"afade=t=in:st=0:d=0.05,afade=t=out:st={fade_out_start:.3f}:d=0.08"
-            f"[{label}]"
-        )
+    source = project_dir / "voiceover-source.mp3"
+    await edge_tts.Communicate(clean_script, voice=voice_id).save(str(source))
+    source_duration = await asyncio.to_thread(probe_video_duration, source)
+    target_duration = max(0.5, target_duration_seconds)
+    # Keep a small tail after speech so the final words are never trimmed.
+    spoken_duration = max(0.25, target_duration - 0.2)
+    tempo = source_duration / spoken_duration
     output = project_dir / "voice-track.m4a"
-    filters.append(f"{''.join(f'[{label}]' for label in labels)}concat=n={len(labels)}:v=0:a=1[voice]")
-    command.extend(
-        [
-            "-filter_complex",
-            ";".join(filters),
-            "-map",
-            "[voice]",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            str(output),
-        ]
-    )
+    command = [
+        ffmpeg_executable(),
+        "-y",
+        "-i",
+        str(source),
+        "-filter:a",
+        (
+            f"aresample=48000,atempo={tempo:.4f},apad,"
+            f"atrim=0:{target_duration:.3f},"
+            "afade=t=in:st=0:d=0.05,"
+            f"afade=t=out:st={max(target_duration - 0.12, 0):.3f}:d=0.12"
+        ),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        str(output),
+    ]
     result = await asyncio.to_thread(
         subprocess.run,
         command,
@@ -3388,8 +3364,8 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
     voice_path = (
         await render_ad_voiceover_track(
             project_dir,
-            beats=beats,
-            segment_durations=segment_durations,
+            script=str(plan.get("voiceover_script", "")),
+            target_duration_seconds=duration,
             voice_id=project["voice_id"],
         )
         if project["voice_enabled"]
