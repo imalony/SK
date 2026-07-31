@@ -49,6 +49,15 @@ camera energy, and narrative action. Write every prompt so that it can follow
 the previous shot and lead naturally into the next. When a cut is intended,
 make the shared visual bridge explicit in the adjacent prompts.
 
+You are the director, not a slideshow editor. Uploaded asset order is only the
+mapping for asset_index and must never dictate shot order. Choose the best
+narrative order yourself: you may reuse a strong hero asset, omit weak or
+redundant assets, introduce an original text-to-video transition or atmosphere
+shot with asset_index -1, and return to an earlier asset later. Select each
+asset_index for its storytelling value and continuity, not to ensure every
+uploaded image appears once. Never invent an asset_index outside the supplied
+list.
+
 Do not distribute durations evenly. Allocate time to narrative beats: a hook
 may be brief, a product demonstration or emotional payoff may be longer, and a
 call to action may be concise. Keep individual local-generation shots practical

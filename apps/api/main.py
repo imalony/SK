@@ -884,7 +884,7 @@ def fallback_ad_plan(project: dict[str, Any], asset_count: int) -> dict[str, Any
         )
     return {
         "title": "商品短视频广告",
-        "strategy": "以素材中的商品细节建立第一印象，再依次展示卖点和行动引导。",
+        "strategy": "以最有表现力的素材建立第一印象，并按叙事需要穿插卖点、氛围和行动引导。",
         "voiceover_script": "好看更好用，细节看得见。现在就来了解这款产品。",
         "post_caption": "把日常的好选择，分享给更多人。",
         "hashtags": ["#好物推荐", "#抖音广告", "#品质生活"],
@@ -903,11 +903,15 @@ def normalize_ad_plan(plan: dict[str, Any], project: dict[str, Any], asset_count
     for index, item in enumerate(raw_segments[:desired_segment_count]):
         if not isinstance(item, dict):
             continue
+        try:
+            requested_asset_index = int(item.get("asset_index", -1))
+        except (TypeError, ValueError):
+            requested_asset_index = -1
         normalized.append(
             {
                 "asset_index": (
-                    max(0, min(asset_count - 1, int(item.get("asset_index", index % asset_count))))
-                    if asset_count
+                    requested_asset_index
+                    if asset_count and -1 <= requested_asset_index < asset_count
                     else -1
                 ),
                 "duration_seconds": max(2, min(15, int(round(float(item.get("duration_seconds", 4)))))),
@@ -3297,8 +3301,9 @@ async def create_ad_plan_version(
         "assets": asset_summary,
         "asset_image_order": (
             "The first attached images are product assets in the same order as the "
-            "asset indexes. Inspect their visible product, packaging, person, and scene "
-            "details. Do not infer anything from file names."
+            "asset indexes. This order is only an index mapping, never a required shot "
+            "order. Inspect their visible product, packaging, person, and scene details. "
+            "Do not infer anything from file names."
             if asset_image_paths
             else "No product reference images are attached."
         ),
@@ -3326,7 +3331,12 @@ async def create_ad_plan_version(
                 "splitting them evenly. The segment durations must add up exactly to the requested duration."
             ),
             (
-                "Use only the asset_index values supplied."
+                "asset_index is the single reference image selected for that shot. You "
+                "may use the supplied asset indexes in any narrative order, reuse an "
+                "asset for multiple shots, skip assets that do not help the story, or "
+                "set asset_index to -1 for an original text-to-video shot when that "
+                "creates a stronger transition, atmosphere, or narrative beat. Do not "
+                "invent an index outside the supplied list."
                 if asset_summary
                 else "No images were supplied. Set asset_index to -1 for every segment and write self-contained text-to-video prompts."
             ),
