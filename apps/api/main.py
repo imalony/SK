@@ -355,6 +355,9 @@ class AdPlanFromSegmentRequest(BaseModel):
 class AdPlanApprovalRequest(BaseModel):
     version: int = Field(ge=1)
     payment_confirmed: bool = False
+    video_provider_id: str | None = Field(default=None, max_length=128)
+    video_resolution: str | None = Field(default=None, max_length=20)
+    video_fps: int | None = Field(default=None, ge=4, le=24)
 
 
 class AdGenerationRequest(BaseModel):
@@ -4908,10 +4911,27 @@ async def approve_ad_plan(
         raise HTTPException(status_code=404, detail="Plan version was not found")
     if project["status"] != "waiting_user_confirmation":
         raise HTTPException(status_code=409, detail="Project is not awaiting plan confirmation")
+    provider_id = request.video_provider_id or project.get(
+        "video_provider_id", DEFAULT_PROVIDER_ID
+    )
     provider = get_provider(
-        project.get("video_provider_id", DEFAULT_PROVIDER_ID),
+        provider_id,
         "image_to_video" if project["assets"] else "text_to_video",
     )
+    resolution = provider_resolution(
+        provider,
+        request.video_resolution
+        if request.video_resolution is not None
+        else project.get("video_resolution"),
+    )
+    fps = provider_fps(
+        provider,
+        request.video_fps
+        if request.video_fps is not None
+        else int(project.get("video_fps") or provider_default_fps(provider)),
+    )
+    if provider.kind == "comfyui":
+        local_video_dimensions(provider, resolution)
     ensure_payment_confirmation(provider, request.payment_confirmed)
     confirmed_at = now()
     with database() as connection:
@@ -4919,8 +4939,18 @@ async def approve_ad_plan(
             "UPDATE ad_plans SET approved_at = ? WHERE id = ?", (confirmed_at, plan["id"])
         )
         connection.execute(
-            "UPDATE ad_projects SET status = 'approved', approved_plan_version = ?, plan_approved_at = ?, error_message = NULL WHERE id = ?",
-            (request.version, confirmed_at, project_id),
+            """
+            UPDATE ad_projects
+            SET status = 'approved',
+                approved_plan_version = ?,
+                plan_approved_at = ?,
+                video_provider_id = ?,
+                video_resolution = ?,
+                video_fps = ?,
+                error_message = NULL
+            WHERE id = ?
+            """,
+            (request.version, confirmed_at, provider.id, resolution, fps, project_id),
         )
     start_ad_project_task(project_id)
     await broadcast_ad_project(project_id)

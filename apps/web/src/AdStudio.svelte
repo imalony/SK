@@ -208,15 +208,24 @@
   ]
 
   $: latestPlan = project?.plans?.[0] ?? null
+  $: effectiveVideoProviderId = project?.status === 'waiting_user_confirmation'
+    ? videoProviderId
+    : (project?.video_provider_id ?? videoProviderId)
   $: activeVideoProvider = videoProviders.find(
-    (provider) => provider.id === (project?.video_provider_id ?? videoProviderId)
+    (provider) => provider.id === effectiveVideoProviderId
   )
   $: videoResolutionOptions = activeVideoProvider?.resolution_options ?? []
-  $: if (!project && videoResolutionOptions.length && !videoResolutionOptions.includes(videoResolution)) {
-    videoResolution = activeVideoProvider?.default_resolution || videoResolutionOptions[0]
-  }
-  $: if (!project && !videoResolutionOptions.length && videoResolution) {
-    videoResolution = ''
+  $: if (activeVideoProvider) {
+    if (videoResolutionOptions.length && !videoResolutionOptions.includes(videoResolution)) {
+      videoResolution = activeVideoProvider.default_resolution || videoResolutionOptions[0]
+    }
+    if (
+      !activeVideoProvider.supports_custom_fps
+      || videoFps < activeVideoProvider.min_fps
+      || videoFps > activeVideoProvider.max_fps
+    ) {
+      videoFps = activeVideoProvider.default_fps
+    }
   }
   $: running = Boolean(project && ['approved', 'generating_segments', 'reviewing_segments', 'composing_audio_video'].includes(project.status))
   $: completed = project?.status === 'completed'
@@ -445,10 +454,13 @@
       project = await request<Project>(`/api/ad-projects/${project.id}/plan-approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          version: paymentConfirmingPlanVersion ?? latestPlan.version,
-          payment_confirmed: paymentConfirmed
-        })
+          body: JSON.stringify({
+            version: paymentConfirmingPlanVersion ?? latestPlan.version,
+          payment_confirmed: paymentConfirmed,
+          video_provider_id: videoProviderId,
+          video_resolution: videoResolution || null,
+          video_fps: videoFps
+          })
       })
       showPaymentConfirmation = false
       paymentConfirmingPlanVersion = null
