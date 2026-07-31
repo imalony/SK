@@ -29,6 +29,7 @@
 
   type Project = {
     id: string
+    brief: string
     status: string
     video_provider_id: string
     video_resolution?: string | null
@@ -114,6 +115,7 @@
   }
 
   const activeProjectStorageKey = 'sk2-ad-active-project-id'
+  const adDraftStorageKey = 'sk2-ad-composer-draft'
   let files: File[] = []
   let previews: string[] = []
   let referenceVideo: File | null = null
@@ -161,6 +163,7 @@
   let historyError = ''
   let showPaymentConfirmation = false
   let paymentConfirmingPlanVersion: number | null = null
+  let draftStorageReady = false
 
   const bgmOptions = [
     { id: 'default/ambient', label: '环境氛围' },
@@ -198,6 +201,18 @@
   }
   $: if (project?.id && typeof localStorage !== 'undefined') {
     localStorage.setItem(activeProjectStorageKey, project.id)
+  }
+  $: if (draftStorageReady && typeof localStorage !== 'undefined') {
+    localStorage.setItem(adDraftStorageKey, JSON.stringify({
+      brief,
+      duration,
+      voiceEnabled,
+      subtitleEnabled,
+      bgmEnabled,
+      voiceId,
+      videoProviderId,
+      videoResolution
+    }))
   }
 
   async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -237,22 +252,35 @@
     referenceVideo = (event.currentTarget as HTMLInputElement).files?.[0] ?? null
   }
 
+  function hydrateComposer(projectToOpen: Project) {
+    brief = projectToOpen.brief || brief
+    duration = projectToOpen.target_duration_seconds || duration
+    voiceEnabled = projectToOpen.voice_enabled
+    subtitleEnabled = projectToOpen.subtitle_enabled
+    bgmEnabled = projectToOpen.bgm_enabled
+    voiceId = projectToOpen.voice_id || voiceId
+    videoProviderId = projectToOpen.video_provider_id || videoProviderId
+    videoResolution = projectToOpen.video_resolution || ''
+  }
+
   async function createPlan() {
     error = ''
     if (brief.trim().length < 3) return error = '请填写简短的产品或活动说明。'
     loading = true
     try {
-      const created = await request<Project>('/api/ad-projects', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          brief, target_duration_seconds: duration, voice_enabled: voiceEnabled,
-          subtitle_enabled: subtitleEnabled, bgm_enabled: bgmEnabled, voice_id: voiceId,
-          video_provider_id: videoProviderId,
-          video_resolution: videoResolution || null
+      const created = project?.status === 'draft'
+        ? project
+        : await request<Project>('/api/ad-projects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            brief, target_duration_seconds: duration, voice_enabled: voiceEnabled,
+            subtitle_enabled: subtitleEnabled, bgm_enabled: bgmEnabled, voice_id: voiceId,
+            video_provider_id: videoProviderId,
+            video_resolution: videoResolution || null
+          })
         })
-      })
-      if (files.length > 0) {
+      if (files.length > 0 && created.assets.length === 0) {
         const form = new FormData()
         files.forEach((file) => form.append('files', file))
         await request<Project>(`/api/ad-projects/${created.id}/assets`, { method: 'POST', body: form })
@@ -665,6 +693,7 @@
     error = ''
     try {
       project = await request<Project>(`/api/ad-projects/${projectId}`)
+      hydrateComposer(project)
       editorPlanId = ''
       showHistory = false
       if (isActiveProjectStatus(project.status)) {
@@ -685,6 +714,20 @@
   })
 
   onMount(async () => {
+    try {
+      const savedDraft = JSON.parse(localStorage.getItem(adDraftStorageKey) || '{}')
+      if (typeof savedDraft.brief === 'string') brief = savedDraft.brief
+      if (typeof savedDraft.duration === 'number') duration = savedDraft.duration
+      if (typeof savedDraft.voiceEnabled === 'boolean') voiceEnabled = savedDraft.voiceEnabled
+      if (typeof savedDraft.subtitleEnabled === 'boolean') subtitleEnabled = savedDraft.subtitleEnabled
+      if (typeof savedDraft.bgmEnabled === 'boolean') bgmEnabled = savedDraft.bgmEnabled
+      if (typeof savedDraft.voiceId === 'string') voiceId = savedDraft.voiceId
+      if (typeof savedDraft.videoProviderId === 'string') videoProviderId = savedDraft.videoProviderId
+      if (typeof savedDraft.videoResolution === 'string') videoResolution = savedDraft.videoResolution
+    } catch {
+      localStorage.removeItem(adDraftStorageKey)
+    }
+    draftStorageReady = true
     try {
       const data = await request<{ default_provider_id: string; providers: VideoProvider[] }>('/api/providers')
       videoProviders = data.providers.filter((provider) => provider.enabled)
