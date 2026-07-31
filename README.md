@@ -390,3 +390,19 @@ Wan, use `123`. The API serializes video jobs with one shared lock.
 `stop-sk2.cmd` stops the frontend, API, ComfyUI, and Ollama. It
 also asks the API to cancel current tasks and release local model resources
 before terminating the managed services.
+
+## Local LTX-Video 2B provider
+
+`Local LTX-Video 2B Distilled FP8` is available in the video provider
+selector. It uses the existing ComfyUI service and does not introduce another
+resident video-model process.
+
+- Supported modes: text-to-video, image-to-video, and continuation from the
+  final frame of the previous video.
+- Model files are stored on F drive:
+  `F:\SK2-models\diffusion_models\ltxv-2b-0.9.8-distilled-fp8.safetensors`,
+  `F:\SK2-models\vae\ltxv_vae.safetensors`, and
+  `F:\SK2-models\text_encoders\t5xxl_fp8_e4m3fn_scaled.safetensors`.
+- The workflow uses 8 sampling steps and aligns requested frames to LTX's
+  `8n + 1` constraint. Use short clips and low resolutions first on an 8 GB
+  GPU.

@@ -1161,6 +1161,13 @@ def configure_workflow(
             "__NEGATIVE_PROMPT__": generation["negative_prompt"],
             "__REFERENCE_IMAGE__": source_input_name or "",
         }
+    elif mode == "continue" and provider.settings.get("continuation_mode") == "last_frame":
+        workflow = read_workflow(workflow_names["image"])
+        replacements = {
+            "__POSITIVE_PROMPT__": generation["prompt"],
+            "__NEGATIVE_PROMPT__": generation["negative_prompt"],
+            "__REFERENCE_IMAGE__": source_input_name or "",
+        }
     elif mode in {"edit", "continue"}:
         workflow = read_workflow(workflow_names["edit"])
         replacements = {
@@ -1175,6 +1182,12 @@ def configure_workflow(
             node["inputs"]["width"] = config["width"]
             node["inputs"]["height"] = config["height"]
             node["inputs"]["length"] = config["length"]
+        elif node["class_type"] in {"EmptyLTXVLatentVideo", "LTXVImgToVideo"}:
+            node["inputs"]["width"] = config["width"]
+            node["inputs"]["height"] = config["height"]
+            node["inputs"]["length"] = max(9, ((config["length"] - 1 + 7) // 8) * 8 + 1)
+        elif node["class_type"] == "LTXVConditioning":
+            node["inputs"]["frame_rate"] = config["fps"]
         elif node["class_type"] == "KSampler":
             node["inputs"]["seed"] = config["seed"]
         elif node["class_type"] == "CreateVideo":
@@ -1892,22 +1905,37 @@ async def run_generation(generation_id: str) -> None:
                     parent = get_generation(generation["parent_generation_id"])
                     if not parent.get("output_path"):
                         raise RuntimeError("Source video output was not found")
-                    tail_path = WORK_DIR / generation_id / "tail.mp4"
-                    await asyncio.to_thread(
-                        extract_video_tail,
-                        MEDIA_DIR / parent["output_path"],
-                        tail_path,
-                        tail_frames=generation["config"]["tail_frames"],
-                        width=generation["config"]["width"],
-                        height=generation["config"]["height"],
-                    )
+                    if provider.settings.get("continuation_mode") == "last_frame":
+                        continuation_path = (
+                            WORK_DIR / generation_id / "continuation-reference.jpg"
+                        )
+                        await asyncio.to_thread(
+                            extract_video_last_frame,
+                            MEDIA_DIR / parent["output_path"],
+                            continuation_path,
+                        )
+                        source_input_name = copy_to_comfy_input(
+                            provider,
+                            continuation_path,
+                            f"continuation-{generation_id}",
+                        )
+                    else:
+                        tail_path = WORK_DIR / generation_id / "tail.mp4"
+                        await asyncio.to_thread(
+                            extract_video_tail,
+                            MEDIA_DIR / parent["output_path"],
+                            tail_path,
+                            tail_frames=generation["config"]["tail_frames"],
+                            width=generation["config"]["width"],
+                            height=generation["config"]["height"],
+                        )
+                        source_input_name = copy_to_comfy_input(
+                            provider,
+                            tail_path,
+                            f"continuation-{generation_id}",
+                        )
                     await set_generation_state(
                         generation_id, "preparing", progress=0.1
-                    )
-                    source_input_name = copy_to_comfy_input(
-                        provider,
-                        tail_path,
-                        f"continuation-{generation_id}",
                     )
 
                 workflow = configure_workflow(provider, generation, source_input_name)
@@ -2688,7 +2716,11 @@ async def run_ad_project(project_id: str) -> None:
                     incoming_transition["should_continue"] = False
             required_capability = (
                 "image_to_video"
-                if should_continue_from_previous and provider.kind == "wanx-video"
+                if should_continue_from_previous
+                and (
+                    provider.kind == "wanx-video"
+                    or provider.settings.get("continuation_mode") == "last_frame"
+                )
                 else "video_edit"
                 if should_continue_from_previous
                 else "image_to_video" if asset else "text_to_video"

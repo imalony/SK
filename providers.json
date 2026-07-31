@@ -24,6 +24,28 @@
       }
     },
     {
+      "id": "local-ltxv-2b-fp8",
+      "label": "Local LTX-Video 2B Distilled FP8",
+      "kind": "comfyui",
+      "model": "LTXV 2B 0.9.8 Distilled FP8",
+      "enabled": true,
+      "capabilities": [
+        "text_to_video",
+        "image_to_video",
+        "video_continue"
+      ],
+      "settings": {
+        "base_url": "http://127.0.0.1:8188",
+        "input_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\input",
+        "output_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\output",
+        "continuation_mode": "last_frame",
+        "workflows": {
+          "text": "ltxv_2b_text_to_video_api.json",
+          "image": "ltxv_2b_image_to_video_api.json"
+        }
+      }
+    },
+    {
       "id": "external-video-api",
       "label": "External Video API (configure first)",
       "kind": "http-api",
