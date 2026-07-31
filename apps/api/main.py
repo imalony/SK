@@ -54,6 +54,11 @@ AD_MEDIA_DIR = MEDIA_DIR / "ad"
 AD_WORK_DIR = WORK_DIR / "ad"
 AD_PROMPT_DIR = Path(__file__).resolve().parent / "prompts" / "ad"
 DATABASE_PATH = DATA_DIR / "sk2.db"
+AD_NEGATIVE_PROMPT = (
+    "low quality, blurry, distorted, flickering, jittery motion, warped product, "
+    "inconsistent packaging, inconsistent face, duplicate subject, extra limbs, "
+    "deformed hands, text, logo, watermark, abrupt camera shake"
+)
 PROVIDERS_PATH = Path(
     os.getenv("SK2_PROVIDERS_PATH", str(ROOT_DIR / "providers.json"))
 )
@@ -160,6 +165,58 @@ def provider_resolution(provider: VideoProvider, requested: str | None) -> str |
     return value or None
 
 
+def provider_supports_custom_fps(provider: VideoProvider) -> bool:
+    return bool(
+        provider.settings.get("supports_custom_fps", provider.kind == "comfyui")
+    )
+
+
+def provider_default_fps(provider: VideoProvider) -> int:
+    return int(provider.settings.get("default_fps", 8))
+
+
+def provider_fps(provider: VideoProvider, requested: int) -> int:
+    if not provider_supports_custom_fps(provider):
+        return provider_default_fps(provider)
+    minimum = int(provider.settings.get("min_fps", 4))
+    maximum = int(provider.settings.get("max_fps", 24))
+    if requested < minimum or requested > maximum:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unsupported frame rate for {provider.label}: {requested}. "
+                f"Choose a value between {minimum} and {maximum}."
+            ),
+        )
+    return requested
+
+
+def local_video_dimensions(provider: VideoProvider, resolution: str | None) -> tuple[int, int]:
+    value = provider_resolution(provider, resolution)
+    if provider.kind != "comfyui":
+        return 288, 512
+    match = re.fullmatch(r"(\d{3,4})x(\d{3,4})", value or "")
+    if match is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Local provider {provider.label} requires a WIDTHxHEIGHT resolution.",
+        )
+    width, height = (int(part) for part in match.groups())
+    if (
+        width < 128
+        or height < 128
+        or width > 1024
+        or height > 1024
+        or width % 16
+        or height % 16
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Local video resolution must be between 128 and 1024 pixels and divisible by 16.",
+        )
+    return width, height
+
+
 def provider_for_generation(generation: dict[str, Any]) -> VideoProvider:
     provider_id = generation["config"].get("provider_id", DEFAULT_PROVIDER_ID)
     if generation["mode"] == "continue":
@@ -232,6 +289,10 @@ def public_provider(provider: VideoProvider) -> dict[str, Any]:
             for value in provider.settings.get("resolution_options", [])
         ],
         "default_resolution": str(provider.settings.get("default_resolution", "")),
+        "supports_custom_fps": provider_supports_custom_fps(provider),
+        "default_fps": provider_default_fps(provider),
+        "min_fps": int(provider.settings.get("min_fps", 4)),
+        "max_fps": int(provider.settings.get("max_fps", 24)),
     }
 
 
@@ -278,6 +339,7 @@ class CreateAdProjectRequest(BaseModel):
     voice_id: str = "zh-CN-XiaoxiaoNeural"
     video_provider_id: str = DEFAULT_PROVIDER_ID
     video_resolution: str | None = Field(default=None, max_length=20)
+    video_fps: int = Field(default=8, ge=4, le=24)
 
 
 class AdPlanFeedbackRequest(BaseModel):
@@ -464,6 +526,7 @@ def initialize_database() -> None:
               bgm_id TEXT NOT NULL DEFAULT 'default/ambient',
               video_provider_id TEXT NOT NULL DEFAULT 'local-wan-vace',
               video_resolution TEXT,
+              video_fps INTEGER NOT NULL DEFAULT 8,
               reference_video_path TEXT,
               reference_analysis_json TEXT,
               tts_provider TEXT NOT NULL,
@@ -593,6 +656,10 @@ def initialize_database() -> None:
             )
         if "video_resolution" not in columns:
             connection.execute("ALTER TABLE ad_projects ADD COLUMN video_resolution TEXT")
+        if "video_fps" not in columns:
+            connection.execute(
+                "ALTER TABLE ad_projects ADD COLUMN video_fps INTEGER NOT NULL DEFAULT 8"
+            )
         if "master_output_path" not in columns:
             connection.execute(
                 "ALTER TABLE ad_projects ADD COLUMN master_output_path TEXT"
@@ -771,6 +838,12 @@ async def request_ad_llm(
 def ad_segment_count(duration_seconds: int) -> int:
     """Keep local video jobs in short, reliable clips."""
     return max(1, min(24, (duration_seconds + 4) // 5))
+
+
+def ad_video_frame_count(duration_seconds: float, fps: int = 8) -> int:
+    """Match a Wan segment to its planned duration using Wan's 4n + 1 frame rule."""
+    desired_frames = max(17, min(81, int(round(duration_seconds * fps))))
+    return max(17, min(81, ((desired_frames - 1 + 3) // 4) * 4 + 1))
 
 
 def ad_voiceover_duration_guidance(duration_seconds: int) -> dict[str, Any]:
@@ -2270,8 +2343,22 @@ async def write_ad_final_copy(
     }
 
 
-def normalize_ad_clip(source: Path, target: Path) -> None:
+def normalize_ad_clip(
+    source: Path,
+    target: Path,
+    *,
+    width: int,
+    height: int,
+    fps: int | None,
+) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
+    filters: list[str] = []
+    if fps is not None:
+        filters.append(f"fps={fps}")
+    filters.append(
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+    )
     result = subprocess.run(
         [
             ffmpeg_executable(),
@@ -2279,7 +2366,7 @@ def normalize_ad_clip(source: Path, target: Path) -> None:
             "-i",
             str(source),
             "-vf",
-            "fps=24,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+            ",".join(filters),
             "-an",
             "-c:v",
             "libx264",
@@ -2299,6 +2386,27 @@ def normalize_ad_clip(source: Path, target: Path) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError(f"Could not normalize ad video: {result.stderr[-500:]}")
+
+
+def ad_cloud_output_dimensions(resolution: str | None) -> tuple[int, int]:
+    return {
+        "480P": (480, 854),
+        "720P": (720, 1280),
+        "1080P": (1080, 1920),
+    }.get((resolution or "").upper(), (720, 1280))
+
+
+def ad_output_settings(project: dict[str, Any]) -> tuple[int, int, int | None]:
+    provider = get_provider(project.get("video_provider_id", DEFAULT_PROVIDER_ID))
+    if provider.kind == "comfyui":
+        width, height = local_video_dimensions(
+            provider, project.get("video_resolution")
+        )
+        return width, height, provider_fps(
+            provider, int(project.get("video_fps") or 8)
+        )
+    width, height = ad_cloud_output_dimensions(project.get("video_resolution"))
+    return width, height, None
 
 
 def concat_ad_clips(clips: list[Path], target: Path, work_dir: Path) -> None:
@@ -2513,10 +2621,18 @@ async def ensure_ad_master(project_id: str, source_paths: list[Path]) -> str:
 
     project_dir = AD_WORK_DIR / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
+    width, height, fps = ad_output_settings(project)
     normalized: list[Path] = []
     for index, source in enumerate(source_paths, start=1):
         target = project_dir / f"normalized-{index:02d}.mp4"
-        await asyncio.to_thread(normalize_ad_clip, source, target)
+        await asyncio.to_thread(
+            normalize_ad_clip,
+            source,
+            target,
+            width=width,
+            height=height,
+            fps=fps,
+        )
         normalized.append(target)
     joined = project_dir / "joined.mp4"
     await asyncio.to_thread(concat_ad_clips, normalized, joined, project_dir)
@@ -2567,16 +2683,31 @@ async def compose_ad_project(project_id: str, plan: dict[str, Any], source_paths
         command.extend(["-i", str(voice_path)])
         voice_duration = await asyncio.to_thread(probe_video_duration, voice_path)
         tempo = min(2.0, max(0.5, voice_duration / max(duration, 0.1)))
-        filters.append(f"[{input_index}:a]atempo={tempo:.4f},apad,atrim=0:{duration:.3f}[voice]")
+        filters.append(
+            f"[{input_index}:a]atempo={tempo:.4f},apad,atrim=0:{duration:.3f},"
+            f"afade=t=in:st=0:d=0.08,afade=t=out:st={max(duration - 0.12, 0):.3f}:d=0.12[voice]"
+        )
         audio_label = "voice"
         input_index += 1
     if project["bgm_enabled"]:
         bgm_path = resolve_ad_bgm(project.get("bgm_id", "default/ambient"))
         if bgm_path:
             command.extend(["-stream_loop", "-1", "-i", str(bgm_path)])
-            filters.append(f"[{input_index}:a]atrim=0:{duration:.3f},afade=t=out:st={max(duration - 1.5, 0):.3f}:d=1.5,volume=0.15[bgm]")
+            filters.append(
+                f"[{input_index}:a]atrim=0:{duration:.3f},"
+                f"afade=t=in:st=0:d=0.3,"
+                f"afade=t=out:st={max(duration - 1.5, 0):.3f}:d=1.5,"
+                "volume=0.20[bgm]"
+            )
             if audio_label:
-                filters.append("[voice][bgm]amix=inputs=2:duration=first:dropout_transition=1[audio]")
+                filters.append(
+                    "[bgm][voice]sidechaincompress=threshold=0.035:ratio=8:"
+                    "attack=15:release=250[ducked_bgm]"
+                )
+                filters.append(
+                    "[voice][ducked_bgm]amix=inputs=2:duration=first:"
+                    "dropout_transition=1:normalize=0[audio]"
+                )
                 audio_label = "audio"
             else:
                 audio_label = "bgm"
@@ -2775,25 +2906,36 @@ async def run_ad_project(project_id: str) -> None:
                         retry_count,
                     ),
                 )
-            length = 49
+            requested_fps = int(project.get("video_fps") or 8)
+            fps = provider_fps(provider, requested_fps)
+            width, height = local_video_dimensions(
+                provider, project.get("video_resolution")
+            )
+            length = ad_video_frame_count(target_seconds, fps)
             config = {
-                "width": 288,
-                "height": 512,
+                "width": width,
+                "height": height,
                 "resolution": project.get("video_resolution"),
                 "length": length,
-                "fps": 8,
+                "fps": fps,
                 "seed": int.from_bytes(os.urandom(8), "big"),
                 "provider_id": provider.id,
                 "provider_model": provider.model,
             }
             if should_continue_from_previous:
                 config.update({"tail_frames": 8, "join_parent": False})
+            generation_mode = (
+                "continue" if should_continue_from_previous else "image" if asset else "text"
+            )
+            generation_parent_id = (
+                previous_generation_id if should_continue_from_previous else None
+            )
             generation = make_generation(
-                mode="continue" if should_continue_from_previous else "image" if asset else "text",
+                mode=generation_mode,
                 prompt=prompt,
-                negative_prompt="blurry, distorted, flickering, text, watermark, duplicate product",
+                negative_prompt=AD_NEGATIVE_PROMPT,
                 reference_asset_id=reference_asset_id if not should_continue_from_previous else None,
-                parent_generation_id=previous_generation_id if should_continue_from_previous else None,
+                parent_generation_id=generation_parent_id,
                 config=config,
             )
             with database() as connection:
@@ -2818,6 +2960,77 @@ async def run_ad_project(project_id: str) -> None:
                 current_duration_seconds=current_duration,
                 continuation_count=continuation_count,
             )
+            if review.get("approved") is False:
+                with database() as connection:
+                    connection.execute(
+                        "UPDATE ad_segments SET status = 'rejected', review_json = ? WHERE id = ?",
+                        (json.dumps(review, ensure_ascii=False), segment_id),
+                    )
+                retry_prompt = str(review.get("retry_prompt") or prompt).strip()
+                if len(retry_prompt) < 5:
+                    raise RuntimeError(
+                        f"Segment {sequence} was rejected but no usable retry prompt was returned"
+                    )
+                retry_count += 1
+                segment_id = uuid.uuid4().hex
+                prompt = retry_prompt[:3000]
+                with database() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO ad_segments (
+                          id, project_id, plan_id, sequence_number, asset_id,
+                          parent_segment_id, target_duration_seconds, prompt,
+                          retry_count, status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')
+                        """,
+                        (
+                            segment_id,
+                            project_id,
+                            plan_record["id"],
+                            sequence,
+                            segment_asset_id,
+                            previous_segment_id if should_continue_from_previous else None,
+                            target_seconds,
+                            prompt,
+                            retry_count,
+                        ),
+                    )
+                generation = make_generation(
+                    mode=generation_mode,
+                    prompt=prompt,
+                    negative_prompt=AD_NEGATIVE_PROMPT,
+                    reference_asset_id=reference_asset_id if not should_continue_from_previous else None,
+                    parent_generation_id=generation_parent_id,
+                    config={**config, "seed": int.from_bytes(os.urandom(8), "big")},
+                )
+                with database() as connection:
+                    connection.execute(
+                        "UPDATE ad_segments SET generation_id = ? WHERE id = ?",
+                        (generation["id"], segment_id),
+                    )
+                await broadcast_ad_project(project_id)
+                start_generation_task(generation["id"])
+                generated = await wait_for_generation(generation["id"])
+                output_path = MEDIA_DIR / generated["output_path"]
+                current_duration = await asyncio.to_thread(probe_video_duration, output_path)
+                frames = await asyncio.to_thread(extract_ad_keyframes, output_path, frame_dir / "retry-1")
+                review = await review_ad_segment(
+                    project,
+                    plan,
+                    definition,
+                    frames,
+                    current_duration_seconds=current_duration,
+                    continuation_count=continuation_count,
+                )
+                if review.get("approved") is False:
+                    with database() as connection:
+                        connection.execute(
+                            "UPDATE ad_segments SET status = 'rejected', review_json = ? WHERE id = ?",
+                            (json.dumps(review, ensure_ascii=False), segment_id),
+                        )
+                    raise RuntimeError(
+                        f"Segment {sequence} was rejected again after an automatic quality retry"
+                    )
             while (
                 bool(review.get("should_continue"))
                 and current_duration + 0.25 < target_seconds
@@ -2827,10 +3040,19 @@ async def run_ad_project(project_id: str) -> None:
                 continuation = make_generation(
                     mode="continue",
                     prompt=str(review.get("continuation_prompt") or prompt),
-                    negative_prompt="blurry, distorted, flickering, text, watermark, duplicate product",
+                    negative_prompt=AD_NEGATIVE_PROMPT,
                     parent_generation_id=generated["id"],
                     config={
                         **config,
+                        "length": ad_video_frame_count(
+                            max(
+                                2.0,
+                                target_seconds
+                                - current_duration
+                                + 8 / config["fps"],
+                            ),
+                            config["fps"],
+                        ),
                         "tail_frames": 8,
                         "join_parent": True,
                         "seed": int.from_bytes(os.urandom(8), "big"),
@@ -3189,14 +3411,18 @@ async def create_ad_project(request: CreateAdProjectRequest) -> dict[str, Any]:
     project_id = uuid.uuid4().hex
     provider = get_provider(request.video_provider_id)
     resolution = provider_resolution(provider, request.video_resolution)
+    fps = provider_fps(provider, request.video_fps)
+    if provider.kind == "comfyui":
+        local_video_dimensions(provider, resolution)
     with database() as connection:
         connection.execute(
             """
             INSERT INTO ad_projects (
               id, brief, target_duration_seconds, voice_enabled, subtitle_enabled,
               bgm_enabled, tts_provider, voice_id, video_provider_id, video_resolution,
+              video_fps,
               status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?)
             """,
             (
                 project_id,
@@ -3209,6 +3435,7 @@ async def create_ad_project(request: CreateAdProjectRequest) -> dict[str, Any]:
                 request.voice_id,
                 provider.id,
                 resolution,
+                fps,
                 now(),
             ),
         )

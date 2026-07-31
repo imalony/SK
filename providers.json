@@ -14,6 +14,12 @@
       ],
       "settings": {
         "base_url": "http://127.0.0.1:8188",
+        "resolution_options": ["288x512", "320x576"],
+        "default_resolution": "288x512",
+        "supports_custom_fps": true,
+        "default_fps": 8,
+        "min_fps": 4,
+        "max_fps": 16,
         "input_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\input",
         "output_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\output",
         "workflows": {
@@ -36,6 +42,12 @@
       ],
       "settings": {
         "base_url": "http://127.0.0.1:8188",
+        "resolution_options": ["288x512", "320x576"],
+        "default_resolution": "288x512",
+        "supports_custom_fps": true,
+        "default_fps": 24,
+        "min_fps": 8,
+        "max_fps": 24,
         "input_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\input",
         "output_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\output",
         "continuation_mode": "last_frame",

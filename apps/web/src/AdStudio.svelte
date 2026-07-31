@@ -33,6 +33,7 @@
     status: string
     video_provider_id: string
     video_resolution?: string | null
+    video_fps: number
     target_duration_seconds: number
     voice_enabled: boolean
     subtitle_enabled: boolean
@@ -88,6 +89,10 @@
     requires_payment_confirmation: boolean
     resolution_options: string[]
     default_resolution: string
+    supports_custom_fps: boolean
+    default_fps: number
+    min_fps: number
+    max_fps: number
   }
 
   type AdModelSettings = {
@@ -151,6 +156,7 @@
   let videoProviders: VideoProvider[] = []
   let videoProviderId = 'local-wan-vace'
   let videoResolution = ''
+  let videoFps = 8
   let showModelSettings = false
   let settingsBaseUrl = 'https://fjbigmodel.fjdac.cn/v1'
   let settingsModel = 'gpt-5.5'
@@ -211,7 +217,8 @@
       bgmEnabled,
       voiceId,
       videoProviderId,
-      videoResolution
+      videoResolution,
+      videoFps
     }))
   }
 
@@ -261,6 +268,7 @@
     voiceId = projectToOpen.voice_id || voiceId
     videoProviderId = projectToOpen.video_provider_id || videoProviderId
     videoResolution = projectToOpen.video_resolution || ''
+    videoFps = projectToOpen.video_fps || videoFps
   }
 
   async function createPlan() {
@@ -277,7 +285,8 @@
             brief, target_duration_seconds: duration, voice_enabled: voiceEnabled,
             subtitle_enabled: subtitleEnabled, bgm_enabled: bgmEnabled, voice_id: voiceId,
             video_provider_id: videoProviderId,
-            video_resolution: videoResolution || null
+            video_resolution: videoResolution || null,
+            video_fps: videoFps
           })
         })
       if (files.length > 0 && created.assets.length === 0) {
@@ -614,7 +623,9 @@
           body: JSON.stringify({
             brief, target_duration_seconds: duration, voice_enabled: voiceEnabled,
             subtitle_enabled: subtitleEnabled, bgm_enabled: bgmEnabled, voice_id: voiceId,
-            video_provider_id: videoProviderId, video_resolution: videoResolution || null
+            video_provider_id: videoProviderId,
+            video_resolution: videoResolution || null,
+            video_fps: videoFps
           })
         })
       }
@@ -724,6 +735,7 @@
       if (typeof savedDraft.voiceId === 'string') voiceId = savedDraft.voiceId
       if (typeof savedDraft.videoProviderId === 'string') videoProviderId = savedDraft.videoProviderId
       if (typeof savedDraft.videoResolution === 'string') videoResolution = savedDraft.videoResolution
+      if (typeof savedDraft.videoFps === 'number') videoFps = savedDraft.videoFps
     } catch {
       localStorage.removeItem(adDraftStorageKey)
     }
@@ -1073,6 +1085,24 @@
               </select>
             </label>
           {/if}
+          <label>
+            <span>视频帧率 (FPS)</span>
+            <input
+              type="number"
+              min={activeVideoProvider?.min_fps ?? 4}
+              max={activeVideoProvider?.max_fps ?? 24}
+              step="1"
+              bind:value={videoFps}
+              disabled={!activeVideoProvider?.supports_custom_fps}
+            />
+            <small>
+              {#if activeVideoProvider?.supports_custom_fps}
+                本地模型可设置 {activeVideoProvider.min_fps}-{activeVideoProvider.max_fps} FPS。更高帧率会增加显存占用和生成时间。
+              {:else}
+                此云端模型按原生帧率输出（{activeVideoProvider?.default_fps ?? 8} FPS），无需设置。
+              {/if}
+            </small>
+          </label>
           <label>
             <span>规划与提示词大模型地址</span>
             <input type="url" bind:value={settingsBaseUrl} placeholder="https://.../v1" />
