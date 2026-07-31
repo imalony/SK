@@ -24,6 +24,7 @@
         "min_frames": 17,
         "max_frames": 81,
         "planned_segment_max_seconds": 15,
+        "continuation_tail_frames": 8,
         "input_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\input",
         "output_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\output",
         "workflows": {
@@ -59,6 +60,7 @@
         "input_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\input",
         "output_dir": "F:\\SK2-runtime\\ComfyUI_windows_portable\\ComfyUI\\output",
         "continuation_mode": "last_frame",
+        "continuation_tail_frames": 1,
         "workflows": {
           "text": "ltxv_2b_text_to_video_api.json",
           "image": "ltxv_2b_image_to_video_api.json"

@@ -955,6 +955,17 @@ def provider_frame_spec(provider: VideoProvider) -> tuple[int, int, int]:
     )
 
 
+def provider_continuation_tail_frames(provider: VideoProvider) -> int:
+    configured = provider.settings.get("continuation_tail_frames")
+    if configured is None:
+        configured = (
+            1
+            if provider.settings.get("continuation_mode") == "last_frame"
+            else 8
+        )
+    return max(1, min(24, int(configured)))
+
+
 def ad_video_frame_count(
     duration_seconds: float, fps: int, provider: VideoProvider
 ) -> int:
@@ -1585,7 +1596,13 @@ def configure_workflow(
         elif node["class_type"] in {"EmptyLTXVLatentVideo", "LTXVImgToVideo"}:
             node["inputs"]["width"] = config["width"]
             node["inputs"]["height"] = config["height"]
-            node["inputs"]["length"] = max(9, ((config["length"] - 1 + 7) // 8) * 8 + 1)
+            alignment = max(1, int(config.get("frame_alignment", 8)))
+            node["inputs"]["length"] = max(
+                9,
+                ((config["length"] - 1 + alignment - 1) // alignment)
+                * alignment
+                + 1,
+            )
         elif node["class_type"] == "LTXVConditioning":
             node["inputs"]["frame_rate"] = config["fps"]
         elif node["class_type"] == "KSampler":
@@ -3426,6 +3443,15 @@ async def run_ad_project(project_id: str) -> None:
         if plan_record is None:
             raise RuntimeError("Approved advertising plan was not found")
         plan = plan_record["plan"]
+        recovered_segments = recover_ad_segments_after_review_validation(
+            project, plan_record
+        )
+        if recovered_segments:
+            with database() as connection:
+                connection.execute(
+                    "UPDATE ad_projects SET error_message = NULL WHERE id = ?",
+                    (project_id,),
+                )
         assets = project["assets"]
         await set_ad_project_state(project_id, "generating_segments")
         source_paths: list[Path] = []
@@ -3567,12 +3593,18 @@ async def run_ad_project(project_id: str) -> None:
                 "resolution": project.get("video_resolution"),
                 "length": length,
                 "fps": fps,
+                "frame_alignment": provider_frame_spec(provider)[0],
                 "seed": int.from_bytes(os.urandom(8), "big"),
                 "provider_id": provider.id,
                 "provider_model": provider.model,
             }
             if should_continue_from_previous:
-                config.update({"tail_frames": 8, "join_parent": False})
+                config.update(
+                    {
+                        "tail_frames": provider_continuation_tail_frames(provider),
+                        "join_parent": False,
+                    }
+                )
             generation_mode = (
                 "continue" if should_continue_from_previous else "image" if asset else "text"
             )
@@ -3602,7 +3634,8 @@ async def run_ad_project(project_id: str) -> None:
             await set_ad_project_state(project_id, "reviewing_segments")
             continuation_count = 0
             _, _, native_clip_seconds = ad_segment_duration_bounds(provider, fps)
-            continuation_overlap_seconds = 8 / max(fps, 1)
+            continuation_tail_frames = provider_continuation_tail_frames(provider)
+            continuation_overlap_seconds = continuation_tail_frames / max(fps, 1)
             maximum_continuations = max(
                 3,
                 int(
@@ -3717,12 +3750,12 @@ async def run_ad_project(project_id: str) -> None:
                                 2.0,
                                 target_seconds
                                 - current_duration
-                                + 8 / config["fps"],
+                                + continuation_tail_frames / config["fps"],
                             ),
                             config["fps"],
                             provider,
                         ),
-                        "tail_frames": 8,
+                        "tail_frames": continuation_tail_frames,
                         "join_parent": True,
                         "seed": int.from_bytes(os.urandom(8), "big"),
                     },
@@ -3800,6 +3833,57 @@ def start_ad_project_task(project_id: str) -> None:
     task = asyncio.create_task(run_ad_project(project_id))
     ad_project_tasks[project_id] = task
     task.add_done_callback(lambda _: ad_project_tasks.pop(project_id, None))
+
+
+def recover_ad_segments_after_review_validation(
+    project: dict[str, Any], plan_record: dict[str, Any]
+) -> int:
+    """Reuse completed video outputs when only the review response validation failed."""
+    error_message = str(project.get("error_message") or "")
+    if "Advertising segment review was unavailable or invalid" not in error_message:
+        return 0
+
+    recovered = 0
+    for segment in project["segments"]:
+        if segment.get("plan_id") != plan_record["id"]:
+            continue
+        if segment.get("status") == "succeeded":
+            continue
+        generation = segment.get("generation") or {}
+        output_path = generation.get("output_path")
+        if generation.get("status") != "succeeded" or not output_path:
+            continue
+        output = MEDIA_DIR / str(output_path)
+        if not output.is_file():
+            continue
+        review = {
+            "approved": True,
+            "reason": (
+                "The video generation had already succeeded. The prior review "
+                "response failed schema validation, so this output was recovered "
+                "without another video-model call."
+            ),
+            "preserve": [],
+            "should_continue": False,
+            "continue_reason": "Recovered after review validation failure.",
+            "continuation_prompt": "",
+            "retry_prompt": "",
+            "recovered_without_video_retry": True,
+        }
+        with database() as connection:
+            connection.execute(
+                """
+                UPDATE ad_segments
+                SET status = 'succeeded', output_path = ?, review_json = ?
+                WHERE id = ?
+                """,
+                (str(output_path), json.dumps(review, ensure_ascii=False), segment["id"]),
+            )
+        segment["status"] = "succeeded"
+        segment["output_path"] = str(output_path)
+        segment["review"] = review
+        recovered += 1
+    return recovered
 
 
 async def run_ad_recompose(project_id: str) -> None:
