@@ -40,27 +40,6 @@
       }
     },
     {
-      "id": "local-framepack",
-      "label": "Local FramePack I2V (long video)",
-      "kind": "framepack-gradio",
-      "model": "FramePackI2V_HY",
-      "enabled": true,
-      "capabilities": [
-        "image_to_video",
-        "video_continue"
-      ],
-      "settings": {
-        "base_url": "http://127.0.0.1:7860",
-        "api_name": "/generate",
-        "fixed_fps": 30,
-        "steps": 25,
-        "gpu_memory_preservation_gb": 6,
-        "use_teacache": true,
-        "mp4_crf": 16,
-        "startup_note": "Requires service 5. The first startup downloads more than 30 GB of model weights."
-      }
-    },
-    {
       "id": "agnes-video-v2",
       "label": "Agnes Video V2.0 (cloud)",
       "kind": "agnes-video",

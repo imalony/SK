@@ -373,26 +373,6 @@ submission. The API enforces the second confirmation, so a direct request
 without `payment_confirmed: true` is rejected before any Alibaba task is
 created.
 
-## FramePack local long-video provider
-
-FramePack is installed at `F:\SK2-runtime\FramePack` and is available in the
-video provider selector as `Local FramePack I2V (long video)`.
-
-- It supports image-to-video and continuation only. It does not support pure
-  text-to-video or instruction-based editing in this application.
-- The first time service `5` starts, FramePack downloads more than 30 GB of
-  model weights to `F:\SK2-runtime\FramePack\hf_download`. This is a local
-  download only; no cloud video task or Alibaba trial quota is used.
-- Before FramePack starts, SK2 configures its local Gradio endpoint as
-  `/generate` through `scripts\configure-framepack-api.ps1`. This keeps the
-  backend integration reproducible after FramePack is updated or reinstalled.
-- FramePack outputs at 30 FPS and determines its working resolution from the
-  uploaded reference image. The frame count and FPS entered in SK2 are
-  converted into the requested duration.
-- For continuation, SK2 extracts the final frame from the selected video,
-  sends it to FramePack as the new initial image, and then joins the result
-  with the previous video.
-
 ### Numeric launcher menu
 
 Double-click `start-sk2.cmd` and enter one or more service numbers:
@@ -403,16 +383,10 @@ Double-click `start-sk2.cmd` and enter one or more service numbers:
 | `2` | Svelte frontend |
 | `3` | ComfyUI local Wan provider |
 | `4` | Ollama local planning model |
-| `5` | FramePack local long-video provider |
 
 The default is `12`, which starts only the backend and frontend. For local
-Wan, use `123`; for FramePack, use `125`. The launcher rejects a selection
-that includes both `3` and `5`, so two local video models cannot be started
-together. The API serializes all video jobs with one shared lock and releases
-ComfyUI models before a FramePack job starts. FramePack can use substantial
-system memory while it dynamically loads models. The launcher waits up to 30
-minutes for the first FramePack start because of the model download.
+Wan, use `123`. The API serializes video jobs with one shared lock.
 
-`stop-sk2.cmd` stops the frontend, API, ComfyUI, Ollama, and FramePack. It
+`stop-sk2.cmd` stops the frontend, API, ComfyUI, and Ollama. It
 also asks the API to cancel current tasks and release local model resources
 before terminating the managed services.

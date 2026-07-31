@@ -89,7 +89,6 @@ class VideoProvider:
         "http-api",
         "agnes-video",
         "wanx-video",
-        "framepack-gradio",
     ]
     model: str
     enabled: bool
@@ -1324,13 +1323,6 @@ async def release_comfy_models(
         pass
 
 
-async def release_all_comfy_models() -> None:
-    async with httpx.AsyncClient(timeout=30) as client:
-        for configured_provider in PROVIDERS.values():
-            if configured_provider.enabled and configured_provider.kind == "comfyui":
-                await release_comfy_models(client, configured_provider)
-
-
 async def interrupt_comfy_provider(provider: VideoProvider) -> None:
     if provider.kind != "comfyui":
         return
@@ -1757,129 +1749,6 @@ async def run_wanx_generation(
     )
 
 
-def framepack_result_path(result: Any) -> Path:
-    value = result[0] if isinstance(result, (list, tuple)) else result
-    if isinstance(value, dict):
-        value = value.get("path") or value.get("video")
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError("FramePack did not return a video file")
-    path = Path(value)
-    if not path.is_file():
-        raise RuntimeError(f"FramePack returned a missing video file: {path}")
-    return path
-
-
-def run_framepack_request(
-    provider: VideoProvider,
-    reference_path: Path,
-    prompt: str,
-    negative_prompt: str,
-    seed: int,
-    duration_seconds: float,
-    work_dir: Path,
-) -> Path:
-    from gradio_client import Client, handle_file
-
-    base_url = str(provider.settings.get("base_url", "")).rstrip("/")
-    api_name = str(provider.settings.get("api_name", "/generate"))
-    if not base_url:
-        raise RuntimeError(f"Provider {provider.id} is missing setting: base_url")
-    if not reference_path.is_file():
-        raise RuntimeError(f"FramePack reference image was not found: {reference_path}")
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-    client = Client(
-        base_url,
-        verbose=False,
-        download_files=str(work_dir),
-        httpx_kwargs={"timeout": 1800},
-    )
-    result = client.predict(
-        handle_file(str(reference_path)),
-        prompt,
-        negative_prompt,
-        seed,
-        max(1.0, min(120.0, duration_seconds)),
-        9,
-        int(provider.settings.get("steps", 25)),
-        1.0,
-        10.0,
-        0.0,
-        float(provider.settings.get("gpu_memory_preservation_gb", 6)),
-        bool(provider.settings.get("use_teacache", True)),
-        int(provider.settings.get("mp4_crf", 16)),
-        api_name=api_name,
-    )
-    return framepack_result_path(result)
-
-
-async def run_framepack_generation(
-    provider: VideoProvider, generation: dict[str, Any]
-) -> None:
-    if generation["mode"] not in {"image", "continue"}:
-        raise RuntimeError(
-            f"Provider {provider.id} only supports image-to-video and video continuation"
-        )
-
-    if generation["mode"] == "image":
-        with database() as connection:
-            asset = connection.execute(
-                "SELECT stored_path FROM assets WHERE id = ?",
-                (generation["reference_asset_id"],),
-            ).fetchone()
-        if asset is None:
-            raise RuntimeError("Reference image was not found")
-        reference_path = Path(asset["stored_path"])
-    else:
-        parent = get_generation(generation["parent_generation_id"])
-        if not parent.get("output_path"):
-            raise RuntimeError("Source video output was not found")
-        reference_path = WORK_DIR / generation["id"] / "continuation-reference.jpg"
-        await asyncio.to_thread(
-            extract_video_last_frame,
-            MEDIA_DIR / parent["output_path"],
-            reference_path,
-        )
-
-    config = generation["config"]
-    duration_seconds = int(config["length"]) / max(1, int(config["fps"]))
-    await set_generation_state(generation["id"], "running", progress=0.15)
-    generated_path = await asyncio.to_thread(
-        run_framepack_request,
-        provider,
-        reference_path,
-        generation["prompt"],
-        generation["negative_prompt"],
-        int(config["seed"]),
-        duration_seconds,
-        WORK_DIR / generation["id"] / "framepack",
-    )
-
-    target_relative = Path(generation["id"]) / f"{generation['id']}.mp4"
-    target = MEDIA_DIR / target_relative
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if generation["mode"] == "continue" and config.get("join_parent", True):
-        parent = get_generation(generation["parent_generation_id"])
-        await asyncio.to_thread(
-            join_continuation_video,
-            MEDIA_DIR / parent["output_path"],
-            generated_path,
-            target,
-            overlap_seconds=0,
-            width=int(config["width"]),
-            height=int(config["height"]),
-            fps=int(config["fps"]),
-        )
-    else:
-        shutil.copy2(generated_path, target)
-    await set_generation_state(
-        generation["id"],
-        "succeeded",
-        progress=1.0,
-        output_path=target_relative.as_posix(),
-    )
-
-
 async def unload_ollama_model() -> None:
     configured_path = os.getenv("SK2_OLLAMA_EXECUTABLE")
     default_path = Path(
@@ -1992,12 +1861,6 @@ async def run_generation(generation_id: str) -> None:
                 if provider.kind == "wanx-video":
                     model_activity = "cloud_video_provider"
                     await run_wanx_generation(provider, generation)
-                    return
-                if provider.kind == "framepack-gradio":
-                    # FramePack and Wan cannot occupy GPU memory together.
-                    await release_all_comfy_models()
-                    model_activity = "framepack_video_provider"
-                    await run_framepack_generation(provider, generation)
                     return
                 if provider.kind != "comfyui":
                     raise RuntimeError(
@@ -2825,8 +2688,7 @@ async def run_ad_project(project_id: str) -> None:
                     incoming_transition["should_continue"] = False
             required_capability = (
                 "image_to_video"
-                if should_continue_from_previous
-                and provider.kind in {"wanx-video", "framepack-gradio"}
+                if should_continue_from_previous and provider.kind == "wanx-video"
                 else "video_edit"
                 if should_continue_from_previous
                 else "image_to_video" if asset else "text_to_video"
@@ -3084,34 +2946,17 @@ async def provider_availability() -> dict[str, bool]:
                     availability[provider.id] = True
                 except RuntimeError:
                     pass
-            elif provider.kind == "framepack-gradio":
-                try:
-                    response = await client.get(
-                        f"{str(provider.settings.get('base_url', '')).rstrip('/')}/config"
-                    )
-                    availability[provider.id] = response.is_success
-                except httpx.HTTPError:
-                    pass
     return availability
 
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    services: dict[str, bool] = {
-        "comfyui": False,
-        "ollama": False,
-        "framepack": False,
-    }
+    services: dict[str, bool] = {"comfyui": False, "ollama": False}
     provider_status = await provider_availability()
     services["comfyui"] = any(
         provider_status[provider.id]
         for provider in PROVIDERS.values()
         if provider.kind == "comfyui"
-    )
-    services["framepack"] = any(
-        provider_status[provider.id]
-        for provider in PROVIDERS.values()
-        if provider.kind == "framepack-gradio"
     )
     async with httpx.AsyncClient(timeout=4) as client:
         try:
